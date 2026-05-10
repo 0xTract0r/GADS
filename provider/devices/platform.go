@@ -54,10 +54,16 @@ type PlatformDevice interface {
 	GetAppiumPort() string
 	SetAppiumPort(port string)
 	SetNewContext(ctx context.Context, cancel context.CancelFunc)
+	TryBeginSetup() bool
+	EndSetup()
 
 	// Appium state accessors
 	GetAppiumSessionID() string
+	GetControlAppiumSessionID() string
+	GetAppiumLastPingTS() int64
+	GetHasAppiumSession() bool
 	SetAppiumSessionID(id string)
+	SetControlAppiumSessionID(id string)
 	SetAppiumUp(up bool)
 	SetAppiumLastPingTS(ts int64)
 	SetHasAppiumSession(has bool)

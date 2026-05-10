@@ -284,15 +284,17 @@ func DeviceInfo(c *gin.Context) {
 	}
 
 	resp := DeviceInfoResponse{
-		DBDevice:        *platDev.GetDBDevice(),
-		Host:            platDev.GetHost(),
-		Connected:       platDev.IsConnected(),
-		ProviderState:   platDev.GetProviderState(),
-		HardwareModel:   platDev.GetHardwareModelValue(),
-		IsResetting:     platDev.GetIsResetting(),
-		AppiumSessionID: platDev.GetAppiumSessionID(),
-		IsAppiumUp:      platDev.GetIsAppiumUp(),
-		InstalledApps:   platDev.GetInstalledAppBundleIDs(),
+		DBDevice:         *platDev.GetDBDevice(),
+		Host:             platDev.GetHost(),
+		Connected:        platDev.IsConnected(),
+		ProviderState:    platDev.GetProviderState(),
+		HardwareModel:    platDev.GetHardwareModelValue(),
+		IsResetting:      platDev.GetIsResetting(),
+		AppiumLastPingTS: platDev.GetAppiumLastPingTS(),
+		AppiumSessionID:  platDev.GetAppiumSessionID(),
+		IsAppiumUp:       platDev.GetIsAppiumUp(),
+		HasAppiumSession: platDev.GetHasAppiumSession(),
+		InstalledApps:    platDev.GetInstalledAppBundleIDs(),
 	}
 
 	if rcDev, rcOk := platDev.(devices.RemoteControllable); rcOk {

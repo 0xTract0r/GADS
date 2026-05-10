@@ -53,6 +53,8 @@ type IOSDevice struct {
 	WdaReadyChan     chan bool       // signals WebDriverAgent is up after start
 }
 
+var wdaHTTPClient = &http.Client{Timeout: 5 * time.Second}
+
 // Port accessors for router access via type assertion.
 func (d *IOSDevice) GetStreamPort() string    { return d.StreamPort }
 func (d *IOSDevice) GetWDAPort() string       { return d.WDAPort }
@@ -191,7 +193,7 @@ func (d *IOSDevice) disableBroadcastExtensionMemoryLimit() {
 	}
 	pid, err := d.getProcessPid("gads-broadcast-extension")
 	if err != nil {
-		logger.ProviderLogger.LogError("ios_device_setup", fmt.Sprintf("Failed to get pid for GADS broadcast extension process on device `%s` - %s", d.GetUDID(), err))
+		logger.ProviderLogger.LogWarn("ios_device_setup", fmt.Sprintf("GADS broadcast extension process is not running on device `%s`; continuing device setup without disabling its memory limit - %s", d.GetUDID(), err))
 		return
 	}
 	if err := d.disableProcessMemoryLimit(pid); err != nil {
@@ -276,6 +278,7 @@ func (d *IOSDevice) setupAppiumIfNeeded() error {
 // Reset overrides RuntimeState.Reset to close iOS tunnels and free iOS-specific ports.
 func (d *IOSDevice) Reset(reason string) {
 	if d.ResetBase(reason) {
+		d.WDASessionID = ""
 		if d.GoIOSTunnel.Address != "" {
 			d.GoIOSTunnel.Close()
 		}
@@ -285,6 +288,16 @@ func (d *IOSDevice) Reset(reason string) {
 		delete(providerutil.UsedPorts, d.WDAStreamPort)
 		common.MutexManager.LocalDevicePorts.Unlock()
 	}
+}
+
+func isInvalidWDASessionResponse(statusCode int, body []byte) bool {
+	if statusCode < http.StatusBadRequest {
+		return false
+	}
+	responseText := strings.ToLower(string(body))
+	return strings.Contains(responseText, "invalid session id") ||
+		strings.Contains(responseText, "session does not exist") ||
+		strings.Contains(responseText, "session not created")
 }
 
 // AppiumCapabilities returns the iOS-specific Appium server capabilities.
@@ -307,38 +320,205 @@ func (d *IOSDevice) AppiumCapabilities() models.AppiumServerCapabilities {
 func (d *IOSDevice) goIosForward(hostPort string, devicePort string) {
 	hostPortInt, _ := strconv.Atoi(hostPort)
 	devicePortInt, _ := strconv.Atoi(devicePort)
+	isVideoStreamPort := devicePort == "8765" || devicePort == "9100"
 
-	cl, err := forward.Forward(d.GoIOSDeviceEntry, uint16(hostPortInt), uint16(devicePortInt))
-	if err != nil {
-		logger.ProviderLogger.LogError("ios_device_setup", fmt.Sprintf("Failed to forward device port %s to host port %s for device `%s` - %s", devicePort, hostPort, d.GetUDID(), err))
-		d.Reset("Failed to forward device port to host port due to an error.")
+	for {
+		cl, err := forward.Forward(d.GoIOSDeviceEntry, uint16(hostPortInt), uint16(devicePortInt))
+		if err != nil {
+			if isVideoStreamPort {
+				logger.ProviderLogger.LogWarn("ios_device_setup", fmt.Sprintf("Failed to forward video stream port %s to host port %s for iOS device `%s`; keeping device live and retrying - %s", devicePort, hostPort, d.GetUDID(), err))
+				select {
+				case <-d.Context.Done():
+					return
+				case <-time.After(2 * time.Second):
+					continue
+				}
+			}
+			logger.ProviderLogger.LogError("ios_device_setup", fmt.Sprintf("Failed to forward device port %s to host port %s for device `%s` - %s", devicePort, hostPort, d.GetUDID(), err))
+			d.Reset("Failed to forward device port to host port due to an error.")
+			return
+		}
+
+		<-d.Context.Done()
+		cl.Close()
 		return
 	}
+}
 
-	<-d.Context.Done()
-	cl.Close()
+func (d *IOSDevice) readWDASessionIDFromStatus() (string, error) {
+	statusURL := fmt.Sprintf("http://localhost:%v/status", d.WDAPort)
+	statusResp, err := wdaHTTPClient.Get(statusURL)
+	if err != nil {
+		return "", err
+	}
+	defer statusResp.Body.Close()
+
+	if statusResp.StatusCode >= http.StatusBadRequest {
+		body, _ := io.ReadAll(statusResp.Body)
+		return "", fmt.Errorf("WDA status failed with status %d: %s", statusResp.StatusCode, string(body))
+	}
+
+	var statusPayload struct {
+		SessionID string `json:"sessionId"`
+		Value     struct {
+			SessionID string `json:"sessionId"`
+		} `json:"value"`
+	}
+	if err := json.NewDecoder(statusResp.Body).Decode(&statusPayload); err != nil {
+		return "", err
+	}
+
+	sessionID := statusPayload.SessionID
+	if sessionID == "" {
+		sessionID = statusPayload.Value.SessionID
+	}
+	return sessionID, nil
+}
+
+// ClearWDASessionID drops the cached WDA session so the next request re-syncs from live status.
+func (d *IOSDevice) ClearWDASessionID() {
+	d.WDASessionID = ""
+}
+
+func (d *IOSDevice) resolveWDASessionID(forceRefresh bool) (string, error) {
+	if forceRefresh {
+		d.WDASessionID = ""
+	}
+
+	if sessionID, err := d.readWDASessionIDFromStatus(); err == nil && sessionID != "" {
+		if d.WDASessionID != "" && d.WDASessionID != sessionID {
+			logger.ProviderLogger.LogWarn("wda_interact", fmt.Sprintf("WDA session for device `%s` changed from `%s` to `%s`, refreshing cached session", d.GetUDID(), d.WDASessionID, sessionID))
+		}
+		d.WDASessionID = sessionID
+		return sessionID, nil
+	}
+
+	if d.WDASessionID != "" {
+		return d.WDASessionID, nil
+	}
+
+	requestBody := map[string]any{
+		"capabilities": map[string]any{
+			"alwaysMatch": map[string]any{},
+			"firstMatch":  []map[string]any{{}},
+		},
+	}
+	requestJSON, err := json.Marshal(requestBody)
+	if err != nil {
+		return "", fmt.Errorf("marshal WDA session payload: %w", err)
+	}
+
+	createURL := fmt.Sprintf("http://localhost:%v/session", d.WDAPort)
+	resp, err := wdaHTTPClient.Post(createURL, "application/json", bytes.NewReader(requestJSON))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode >= http.StatusBadRequest {
+		return "", fmt.Errorf("create WDA session failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var sessionResp struct {
+		SessionID string `json:"sessionId"`
+		Value     struct {
+			SessionID string `json:"sessionId"`
+		} `json:"value"`
+	}
+	if err := json.Unmarshal(body, &sessionResp); err != nil {
+		return "", fmt.Errorf("decode WDA session response: %w", err)
+	}
+
+	sessionID := sessionResp.SessionID
+	if sessionID == "" {
+		sessionID = sessionResp.Value.SessionID
+	}
+	if sessionID == "" {
+		return "", fmt.Errorf("WDA session response missing sessionId")
+	}
+
+	d.WDASessionID = sessionID
+	return sessionID, nil
+}
+
+// EnsureWDASessionID resolves the current live WDA session, preferring /status over stale cache.
+func (d *IOSDevice) EnsureWDASessionID() (string, error) {
+	return d.resolveWDASessionID(false)
+}
+
+// RefreshWDASessionID forces the next lookup to drop stale cache and re-sync from live WDA.
+func (d *IOSDevice) RefreshWDASessionID() (string, error) {
+	return d.resolveWDASessionID(true)
+}
+
+func (d *IOSDevice) postWDASettings(url string, requestBody []byte) (*http.Response, []byte, error) {
+	response, err := wdaHTTPClient.Post(url, "application/json", bytes.NewReader(requestBody))
+	if err != nil {
+		return nil, nil, err
+	}
+	defer response.Body.Close()
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		return nil, nil, err
+	}
+	return response, body, nil
 }
 
 // UpdateStreamSettingsOnDevice updates WebDriverAgent stream settings.
 func (d *IOSDevice) UpdateStreamSettingsOnDevice() error {
-	var mjpegProperties models.WDAMjpegProperties
-	mjpegProperties.MjpegServerFramerate = d.StreamTargetFPS
-	mjpegProperties.MjpegServerScreenshotQuality = d.StreamJpegQuality
-	mjpegProperties.MjpegServerScalingFactor = d.StreamScalingFactor
-
-	mjpegSettings := models.WDAMjpegSettings{Settings: mjpegProperties}
-	requestBody, err := json.Marshal(mjpegSettings)
+	requestSettings := map[string]any{
+		"mjpegServerFramerate":         d.StreamTargetFPS,
+		"mjpegServerScreenshotQuality": d.StreamJpegQuality,
+		"mjpegScalingFactor":           d.StreamScalingFactor,
+		// 这些等待会直接放大 tap/swipe 延迟，当前场景优先响应速度。
+		"waitForIdleTimeout":      0,
+		"animationCoolOffTimeout": 0,
+	}
+	requestBody, err := json.Marshal(map[string]any{"settings": requestSettings})
 	if err != nil {
 		return err
 	}
 
-	var url = fmt.Sprintf("http://localhost:%v/appium/settings", d.WDAPort)
-	response, err := http.Post(url, "application/json", bytes.NewBuffer(requestBody))
+	sessionID, err := d.EnsureWDASessionID()
+	if err == nil && sessionID != "" {
+		sessionURL := fmt.Sprintf("http://localhost:%v/session/%s/appium/settings", d.WDAPort, sessionID)
+		response, body, err := d.postWDASettings(sessionURL, requestBody)
+		if err == nil {
+			if response.StatusCode == http.StatusOK {
+				return nil
+			}
+			if isInvalidWDASessionResponse(response.StatusCode, body) {
+				refreshedSessionID, refreshErr := d.RefreshWDASessionID()
+				if refreshErr == nil && refreshedSessionID != "" {
+					sessionURL = fmt.Sprintf("http://localhost:%v/session/%s/appium/settings", d.WDAPort, refreshedSessionID)
+					response, body, err = d.postWDASettings(sessionURL, requestBody)
+					if err == nil && response.StatusCode == http.StatusOK {
+						return nil
+					}
+				}
+			}
+			if response.StatusCode != http.StatusNotFound {
+				return fmt.Errorf("could not successfully update WDA session settings, status code=%v body=%s", response.StatusCode, string(body))
+			}
+		}
+	}
+
+	url := fmt.Sprintf("http://localhost:%v/appium/settings", d.WDAPort)
+	response, body, err := d.postWDASettings(url, requestBody)
 	if err != nil {
 		return err
 	}
-	if response.StatusCode != 200 {
-		return fmt.Errorf("could not successfully update WDA stream settings, status code=%v", response.StatusCode)
+	if response.StatusCode == http.StatusNotFound {
+		logger.ProviderLogger.LogWarn("ios_device_setup", fmt.Sprintf("WebDriverAgent on device `%s` does not support /appium/settings, continuing with default stream settings", d.GetUDID()))
+		return nil
+	}
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("could not successfully update WDA stream settings, status code=%v body=%s", response.StatusCode, string(body))
 	}
 	return nil
 }
@@ -535,23 +715,33 @@ func (d *IOSDevice) LaunchApp(bundleID string) error {
 }
 
 func (d *IOSDevice) checkWebDriverAgentUp() {
-	var netClient = &http.Client{Timeout: time.Second * 30}
+	var netClient = &http.Client{Timeout: 2 * time.Second}
 	req, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("http://localhost:%v/status", d.WDAPort), nil)
 
 	loops := 0
 	for {
-		if loops >= 30 {
-			d.Reset("WebDriverAgent did not respond within the expected time.")
+		select {
+		case <-d.Context.Done():
+			return
+		default:
+		}
+
+		if loops >= 60 {
 			return
 		}
 		resp, err := netClient.Do(req)
 		if err != nil {
 			time.Sleep(1 * time.Second)
 		} else {
+			resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
-				d.WdaReadyChan <- true
+				select {
+				case d.WdaReadyChan <- true:
+				default:
+				}
 				return
 			}
+			time.Sleep(1 * time.Second)
 		}
 		loops++
 	}

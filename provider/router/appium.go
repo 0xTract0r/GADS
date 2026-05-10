@@ -194,7 +194,14 @@ func appiumActivateApp(device devices.PlatformDevice, appIdentifier string) (*ht
 			return nil, fmt.Errorf("appiumActivateApp: Failed to marshal request body json when activating app for device `%s` - %s", device.GetUDID(), err)
 		}
 
-		return wdaRequest(device, http.MethodPost, "wda/apps/activate", bytes.NewReader(reqJson))
+		activateAppResp, err := wdaRequestWithSessionFallback(device, http.MethodPost, "wda/apps/activate", reqJson, "wda/apps/activate", reqJson)
+		if err != nil {
+			return activateAppResp, err
+		}
+		if err := ensureSuccessfulResponse(activateAppResp, fmt.Sprintf("activating app `%s`", appIdentifier)); err != nil {
+			return activateAppResp, err
+		}
+		return activateAppResp, nil
 	case "android":
 		requestBody := struct {
 			AppId string `json:"appId"`

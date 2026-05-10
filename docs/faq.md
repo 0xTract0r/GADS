@@ -22,11 +22,23 @@
     - Disconnect your device, find the `GADS-stream` app on it and uninstall it, reconnect the device - hopefully the new set up will be able to start it properly
     - You can also do the above through the UI - load the device, find the `GADS-stream` package in the installed apps and uninstall it. Go to `Admin > Providers Administration` and reset the device from the provider interface.
     - If above doesn't work - disconnect your device, tap on the `GADS-stream` app on it. If it asks for permissions - allow them and press the `Home` button on the device. Check in the notifications for something like `GADS-stream is recording the device screen`. Reconnect the device.
+- *[iOS] The control page says `Waiting for video frames`, why?*
+    - If using the Broadcast Extension path, first check whether `gads-broadcast-extension` is actually running on the device and whether the provider can connect to the forwarded stream port.
+    - If WebRTC is connected but the browser video element still has no dimensions, the page may have received only a track and no decodable H264 keyframe. The Broadcast Extension should send SPS/PPS plus an IDR frame for new clients, and should repeat the latest frame when the screen is static.
+    - See [iOS Broadcast Extension operating guidance](./provider.md#ios-broadcast-extension-operating-guidance).
+- *[iOS] Can the Broadcast Extension stream run all day?*
+    - It can run for active remote-control sessions, but it is not the recommended unattended 24/7 default because ReplayKit screen capture plus H264 encoding can heat the device and later cause throttling, lag, or iOS stopping the broadcast.
+    - For long idle periods, stop the broadcast or add an idle timeout. For long active sessions, lower fps/bitrate and keep the phone physically cool.
 - *I can load the devices in UI but video is choppy/lags behind, is there something I can do?*
-    - No, it is what it is. The Android stream was written by me and is as good as I was able to make it, don't think I can improve on streaming as well. For iOS we use the WebDriverAgent video stream so same applies there - we got what we got.
+    - For Android, first try lowering target FPS or stream quality. For iOS, prefer `ios_webrtc_broadcast` for active remote-control sessions and keep `ios_webrtc_ffmpeg` / WDA MJPEG as a stability fallback.
+    - If `ios_webrtc_broadcast` becomes choppy after a long run, stop the broadcast, cool the device, then restart with lower fps/bitrate.
 - *I can load the devices but interaction is slow/laggy, is there something I can do?*
     - No, it is what it is. GADS uses Appium under the hood for the interactions so we are as fast as it allows us to be.
 - *I can load the device but interaction does not work at all/session expired popup appears, why?*
     - There is probably an issue with Appium setup or dependencies. It is quite possible to start Appium server successfully but everything fails due to missing environment variable like `ANDROID_HOME` or something in that line. Observe the respective device Appium logs either in UI or file
+- *[iOS] The provider stays in `preparing` and Appium immediately exits with `Could not read file 'gads': EISDIR`, why?*
+    - Current Appium 2.5.x can interpret `--use-plugins=gads` as a local CSV/config path if the current working directory contains a `gads` / `GADS` directory on a case-insensitive filesystem.
+    - Check the device-level Appium log file under `<provider-folder>/device_<udid>/appium-server.log`. If it contains `argument --use-plugins: Could not read file 'gads': EISDIR`, the failure is happening before Appium fully starts.
+    - Start the Appium child from a neutral provider/device log folder or use a non-ambiguous plugin list value, for example `gads,`, so Appium parses it as plugin names instead of a file path.
 - *When I want to unlock my phone a session expired popup appears, why?*
   - Make sure your phone is not passcode protected since appium is only unlocking the device and it fails if it lands on the passcode screen 

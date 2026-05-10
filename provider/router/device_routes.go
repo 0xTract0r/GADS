@@ -279,9 +279,15 @@ func DeviceTypeText(c *gin.Context) {
 		api.InternalError(c, err.Error())
 		return
 	}
+	defer typeResp.Body.Close()
 
 	var body []byte
 	body, err = io.ReadAll(typeResp.Body)
+	if err != nil {
+		platDev.GetLogger().LogError("appium_interact", fmt.Sprintf("Failed to read type text response body - %s", err))
+		api.InternalError(c, err.Error())
+		return
+	}
 
 	c.JSON(typeResp.StatusCode, models.APIResponse[any]{Success: typeResp.StatusCode < 400, Message: string(body)})
 }

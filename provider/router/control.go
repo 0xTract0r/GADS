@@ -6,13 +6,17 @@ import (
 	"GADS/provider/config"
 	"GADS/provider/devices"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os/exec"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/danielpaulus/go-ios/ios/instruments"
@@ -21,6 +25,15 @@ import (
 var controlNetClient = &http.Client{
 	Timeout: time.Second * 120,
 }
+
+var controlAppiumSessionLocks sync.Map
+
+const (
+	iosControlSwipeVelocity     = 2500
+	iosControlDragVelocity      = 2500
+	iosControlDragPressDuration = 0.03
+	iosControlDragHoldDuration  = 0.02
+)
 
 func androidRemoteServerRequest(dev devices.PlatformDevice, method, endpoint string, requestBody io.Reader) (*http.Response, error) {
 	andDev, ok := dev.(*devices.AndroidDevice)
@@ -52,11 +65,18 @@ func androidRemoteServerRequestJson(dev devices.PlatformDevice, method, endpoint
 }
 
 func appiumRequest(dev devices.PlatformDevice, method, endpoint string, requestBody io.Reader) (*http.Response, error) {
-	url := fmt.Sprintf("http://localhost:%s/session/%s/%s", dev.GetAppiumPort(), dev.GetAppiumSessionID(), endpoint)
+	return appiumRequestForSession(dev, dev.GetAppiumSessionID(), method, endpoint, requestBody)
+}
+
+func appiumRequestForSession(dev devices.PlatformDevice, sessionID, method, endpoint string, requestBody io.Reader) (*http.Response, error) {
+	url := fmt.Sprintf("http://localhost:%s/session/%s/%s", dev.GetAppiumPort(), sessionID, endpoint)
 	dev.GetLogger().LogDebug("appium_interact", fmt.Sprintf("Calling `%s` for device `%s`", url, dev.GetUDID()))
 	req, err := http.NewRequest(method, url, requestBody)
 	if err != nil {
 		return nil, err
+	}
+	if requestBody != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
 	return controlNetClient.Do(req)
 }
@@ -68,7 +88,26 @@ func appiumRequestNoSession(dev devices.PlatformDevice, method, endpoint string,
 	if err != nil {
 		return nil, err
 	}
+	if requestBody != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	return controlNetClient.Do(req)
+}
+
+func appiumExecuteScript(dev devices.PlatformDevice, script string, args []map[string]any) (*http.Response, error) {
+	return appiumExecuteScriptForSession(dev, dev.GetAppiumSessionID(), script, args)
+}
+
+func appiumExecuteScriptForSession(dev devices.PlatformDevice, sessionID, script string, args []map[string]any) (*http.Response, error) {
+	requestBody := map[string]any{
+		"script": script,
+		"args":   args,
+	}
+	actionJSON, err := json.MarshalIndent(requestBody, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return appiumRequestForSession(dev, sessionID, http.MethodPost, "execute/sync", bytes.NewReader(actionJSON))
 }
 
 func wdaRequest(dev devices.PlatformDevice, method, endpoint string, requestBody io.Reader) (*http.Response, error) {
@@ -83,6 +122,464 @@ func wdaRequest(dev devices.PlatformDevice, method, endpoint string, requestBody
 		return nil, err
 	}
 	return controlNetClient.Do(req)
+}
+
+func wdaSessionRequest(dev devices.PlatformDevice, method, sessionID, endpoint string, requestBody io.Reader) (*http.Response, error) {
+	return wdaRequest(dev, method, fmt.Sprintf("session/%s/%s", sessionID, endpoint), requestBody)
+}
+
+func restoreResponseBody(resp *http.Response, body []byte) *http.Response {
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+	return resp
+}
+
+func ensureSuccessfulResponse(resp *http.Response, action string) error {
+	if resp == nil {
+		return fmt.Errorf("%s failed: empty response", action)
+	}
+	if resp.StatusCode < http.StatusBadRequest {
+		return nil
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		resp.Body.Close()
+		return fmt.Errorf("%s failed with status %d", action, resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	message := strings.TrimSpace(string(body))
+	if message == "" {
+		return fmt.Errorf("%s failed with status %d", action, resp.StatusCode)
+	}
+	return fmt.Errorf("%s failed with status %d: %s", action, resp.StatusCode, message)
+}
+
+func shouldFallbackToWDASession(resp *http.Response, body []byte) bool {
+	if resp.StatusCode == http.StatusNotFound {
+		return true
+	}
+	responseText := strings.ToLower(string(body))
+	return strings.Contains(responseText, "unknown command") || strings.Contains(responseText, "endpoint missing")
+}
+
+func shouldRefreshWDASession(resp *http.Response, body []byte) bool {
+	if resp.StatusCode < http.StatusBadRequest {
+		return false
+	}
+	responseText := strings.ToLower(string(body))
+	return strings.Contains(responseText, "invalid session id") ||
+		strings.Contains(responseText, "session does not exist") ||
+		strings.Contains(responseText, "session not created")
+}
+
+func getOrCreateWDASessionID(dev devices.PlatformDevice) (string, error) {
+	iosDev, ok := dev.(*devices.IOSDevice)
+	if !ok {
+		return "", fmt.Errorf("device %s is not an iOS device", dev.GetUDID())
+	}
+	return iosDev.EnsureWDASessionID()
+}
+
+func refreshWDASessionID(dev devices.PlatformDevice) (string, error) {
+	iosDev, ok := dev.(*devices.IOSDevice)
+	if !ok {
+		return "", fmt.Errorf("device %s is not an iOS device", dev.GetUDID())
+	}
+	return iosDev.RefreshWDASessionID()
+}
+
+func wdaSessionRequestWithRetry(dev devices.PlatformDevice, method, endpoint string, requestBody []byte) (*http.Response, error) {
+	sessionID, err := getOrCreateWDASessionID(dev)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := wdaSessionRequest(dev, method, sessionID, endpoint, bytes.NewReader(requestBody))
+	if err != nil {
+		return nil, err
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		resp.Body.Close()
+		return nil, err
+	}
+	resp.Body.Close()
+
+	if !shouldRefreshWDASession(resp, body) {
+		return restoreResponseBody(resp, body), nil
+	}
+
+	refreshedSessionID, err := refreshWDASessionID(dev)
+	if err != nil {
+		return nil, err
+	}
+
+	return wdaSessionRequest(dev, method, refreshedSessionID, endpoint, bytes.NewReader(requestBody))
+}
+
+func wdaRequestWithSessionFallback(dev devices.PlatformDevice, method, endpoint string, requestBody []byte, sessionEndpoint string, sessionRequestBody []byte) (*http.Response, error) {
+	resp, err := wdaRequest(dev, method, endpoint, bytes.NewReader(requestBody))
+	if err != nil {
+		return nil, err
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		resp.Body.Close()
+		return nil, err
+	}
+	resp.Body.Close()
+
+	if !shouldFallbackToWDASession(resp, body) {
+		return restoreResponseBody(resp, body), nil
+	}
+
+	return wdaSessionRequestWithRetry(dev, method, sessionEndpoint, sessionRequestBody)
+}
+
+func inferDirectionalSwipe(x, y, endX, endY float64) (string, bool) {
+	deltaX := endX - x
+	deltaY := endY - y
+	absDeltaX := math.Abs(deltaX)
+	absDeltaY := math.Abs(deltaY)
+
+	// 仅把位移明显且主方向清晰的拖拽改走 direction 路由，斜向拖拽仍保留坐标拖拽。
+	if math.Max(absDeltaX, absDeltaY) < 80 {
+		return "", false
+	}
+
+	if absDeltaX >= absDeltaY*1.25 {
+		if deltaX > 0 {
+			return "right", true
+		}
+		return "left", true
+	}
+
+	if absDeltaY >= absDeltaX*1.25 {
+		if deltaY > 0 {
+			return "down", true
+		}
+		return "up", true
+	}
+
+	return "", false
+}
+
+func tryWDADirectionalSwipe(dev devices.PlatformDevice, direction string) (*http.Response, error) {
+	requestBody := struct {
+		Direction string `json:"direction"`
+	}{
+		Direction: direction,
+	}
+	actionJSON, err := json.MarshalIndent(requestBody, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := wdaSessionRequestWithRetry(dev, http.MethodPost, "wda/swipe", actionJSON)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= http.StatusBadRequest {
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("directional WDA swipe failed with status %d", resp.StatusCode)
+		}
+		return nil, fmt.Errorf("directional WDA swipe failed with status %d: %s", resp.StatusCode, string(body))
+	}
+	return resp, nil
+}
+
+func shouldRefreshAppiumSession(resp *http.Response, body []byte) bool {
+	if resp == nil || resp.StatusCode < http.StatusBadRequest {
+		return false
+	}
+	responseText := strings.ToLower(string(body))
+	return strings.Contains(responseText, "invalid session id") ||
+		strings.Contains(responseText, "a session is either terminated or not started") ||
+		strings.Contains(responseText, "nosuchdrivererror") ||
+		strings.Contains(responseText, "no such driver")
+}
+
+func clearStalePrimaryAppiumSession(dev devices.PlatformDevice, staleSessionID string) {
+	staleSessionID = strings.TrimSpace(staleSessionID)
+	if staleSessionID == "" || staleSessionID == strings.TrimSpace(dev.GetControlAppiumSessionID()) {
+		return
+	}
+	if strings.TrimSpace(dev.GetAppiumSessionID()) != staleSessionID {
+		return
+	}
+	dev.SetAppiumSessionID("")
+	dev.SetHasAppiumSession(false)
+	dev.SetAppiumLastPingTS(0)
+}
+
+func getControlAppiumSessionLock(dev devices.PlatformDevice) *sync.Mutex {
+	value, _ := controlAppiumSessionLocks.LoadOrStore(dev.GetUDID(), &sync.Mutex{})
+	return value.(*sync.Mutex)
+}
+
+func deleteControlAppiumSession(dev devices.PlatformDevice) {
+	lock := getControlAppiumSessionLock(dev)
+	lock.Lock()
+	defer lock.Unlock()
+
+	sessionID := strings.TrimSpace(dev.GetControlAppiumSessionID())
+	if sessionID == "" || dev.GetAppiumPort() == "" {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	url := fmt.Sprintf("http://localhost:%s/session/%s", dev.GetAppiumPort(), sessionID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
+	if err != nil {
+		dev.GetLogger().LogWarn("appium_interact", fmt.Sprintf("Failed to prepare control Appium session delete for device `%s`: %v", dev.GetUDID(), err))
+		dev.SetControlAppiumSessionID("")
+		return
+	}
+
+	resp, err := controlNetClient.Do(req)
+	if err != nil {
+		dev.GetLogger().LogWarn("appium_interact", fmt.Sprintf("Best-effort delete of control Appium session `%s` for device `%s` failed: %v", sessionID, dev.GetUDID(), err))
+		dev.SetControlAppiumSessionID("")
+		return
+	}
+	resp.Body.Close()
+	dev.SetControlAppiumSessionID("")
+}
+
+func hasExternalAppiumSession(dev devices.PlatformDevice) bool {
+	sessionID := strings.TrimSpace(dev.GetAppiumSessionID())
+	if sessionID == "" {
+		return false
+	}
+	return sessionID != strings.TrimSpace(dev.GetControlAppiumSessionID())
+}
+
+func restoreAppiumResponse(resp *http.Response) (*http.Response, bool, error) {
+	if resp == nil {
+		return nil, false, fmt.Errorf("empty Appium response")
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		resp.Body.Close()
+		return nil, false, err
+	}
+	resp.Body.Close()
+	restoredResp := restoreResponseBody(resp, body)
+	if shouldRefreshAppiumSession(resp, body) {
+		return restoredResp, true, nil
+	}
+	if resp.StatusCode >= http.StatusBadRequest {
+		return restoredResp, false, fmt.Errorf("Appium request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return restoredResp, false, nil
+}
+
+func getOrCreateControlAppiumSessionID(dev devices.PlatformDevice) (string, error) {
+	if dev.GetOS() != "ios" {
+		return "", fmt.Errorf("device %s is not an iOS device", dev.GetUDID())
+	}
+
+	lock := getControlAppiumSessionLock(dev)
+	lock.Lock()
+	defer lock.Unlock()
+
+	if sessionID := strings.TrimSpace(dev.GetControlAppiumSessionID()); sessionID != "" {
+		return sessionID, nil
+	}
+	return createControlAppiumSession(dev)
+}
+
+func createControlAppiumSession(dev devices.PlatformDevice) (string, error) {
+	if dev.GetOS() != "ios" {
+		return "", fmt.Errorf("device %s is not an iOS device", dev.GetUDID())
+	}
+	if dev.GetAppiumPort() == "" || !dev.GetIsAppiumUp() {
+		return "", fmt.Errorf("Appium is not ready for device %s", dev.GetUDID())
+	}
+
+	caps := map[string]any{
+		"platformName":              "iOS",
+		"appium:automationName":     "XCUITest",
+		"appium:udid":               dev.GetUDID(),
+		"appium:autoLaunch":         false,
+		"appium:shouldTerminateApp": false,
+		"appium:forceAppLaunch":     false,
+		"appium:newCommandTimeout":  3600,
+	}
+	if iosDev, ok := dev.(*devices.IOSDevice); ok {
+		caps["appium:webDriverAgentUrl"] = "http://localhost:" + iosDev.GetWDAPort()
+	}
+
+	requestBody := map[string]any{
+		"capabilities": map[string]any{
+			"alwaysMatch": caps,
+			"firstMatch":  []map[string]any{{}},
+		},
+	}
+	actionJSON, err := json.MarshalIndent(requestBody, "", "  ")
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := appiumRequestNoSession(dev, http.MethodPost, "session", bytes.NewReader(actionJSON))
+	if err != nil {
+		return "", err
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		resp.Body.Close()
+		return "", err
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		return "", fmt.Errorf("creating control Appium session failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var sessionResp struct {
+		SessionID string `json:"sessionId"`
+		Value     struct {
+			SessionID string `json:"sessionId"`
+		} `json:"value"`
+	}
+	if err := json.Unmarshal(body, &sessionResp); err != nil {
+		return "", fmt.Errorf("parsing control Appium session response failed: %w", err)
+	}
+
+	sessionID := strings.TrimSpace(sessionResp.SessionID)
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(sessionResp.Value.SessionID)
+	}
+	if sessionID == "" {
+		return "", fmt.Errorf("Appium createSession returned empty session id")
+	}
+
+	dev.SetControlAppiumSessionID(sessionID)
+	dev.SetAppiumSessionID(sessionID)
+	dev.SetHasAppiumSession(true)
+	dev.SetAppiumLastPingTS(time.Now().UnixMilli())
+	dev.GetLogger().LogInfo("appium_interact", fmt.Sprintf("Created control Appium session `%s` for device `%s`", sessionID, dev.GetUDID()))
+	return sessionID, nil
+}
+
+func executeIOSSwipeViaAppiumSession(dev devices.PlatformDevice, sessionID string, x, y, endX, endY float64) (*http.Response, bool, error) {
+	if direction, ok := inferDirectionalSwipe(x, y, endX, endY); ok {
+		resp, err := appiumExecuteScriptForSession(dev, sessionID, "mobile: swipe", []map[string]any{{
+			"direction": direction,
+			"velocity":  iosControlSwipeVelocity,
+		}})
+		if err != nil {
+			return nil, false, err
+		}
+		return restoreAppiumResponse(resp)
+	}
+
+	fromX, fromY, err := normalizeIOSPointForAppium(dev, x, y)
+	if err != nil {
+		return nil, false, err
+	}
+	toX, toY, err := normalizeIOSPointForAppium(dev, endX, endY)
+	if err != nil {
+		return nil, false, err
+	}
+
+	resp, err := appiumExecuteScriptForSession(dev, sessionID, "mobile: dragFromToWithVelocity", []map[string]any{{
+		"fromX":         fromX,
+		"fromY":         fromY,
+		"toX":           toX,
+		"toY":           toY,
+		"pressDuration": iosControlDragPressDuration,
+		"holdDuration":  iosControlDragHoldDuration,
+		"velocity":      iosControlDragVelocity,
+	}})
+	if err != nil {
+		return nil, false, err
+	}
+	return restoreAppiumResponse(resp)
+}
+
+func executeIOSSwipeViaControlSession(dev devices.PlatformDevice, x, y, endX, endY float64) (*http.Response, error) {
+	sessionID, err := getOrCreateControlAppiumSessionID(dev)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, shouldRefresh, err := executeIOSSwipeViaAppiumSession(dev, sessionID, x, y, endX, endY)
+	if err != nil {
+		return nil, err
+	}
+	if !shouldRefresh {
+		return resp, nil
+	}
+
+	dev.GetLogger().LogWarn("appium_interact", fmt.Sprintf("Control Appium session `%s` became invalid for device `%s`, recreating", sessionID, dev.GetUDID()))
+	deleteControlAppiumSession(dev)
+
+	sessionID, err = getOrCreateControlAppiumSessionID(dev)
+	if err != nil {
+		return nil, err
+	}
+	resp, _, err = executeIOSSwipeViaAppiumSession(dev, sessionID, x, y, endX, endY)
+	return resp, err
+}
+
+func executeIOSScriptViaAppiumSession(dev devices.PlatformDevice, sessionID string, script string, args []map[string]any) (*http.Response, bool, error) {
+	resp, err := appiumExecuteScriptForSession(dev, sessionID, script, args)
+	if err != nil {
+		return nil, false, err
+	}
+	return restoreAppiumResponse(resp)
+}
+
+func executeIOSScriptViaBestSession(dev devices.PlatformDevice, script string, args []map[string]any) (*http.Response, error) {
+	if hasExternalAppiumSession(dev) {
+		primarySessionID := dev.GetAppiumSessionID()
+		resp, shouldRefresh, err := executeIOSScriptViaAppiumSession(dev, dev.GetAppiumSessionID(), script, args)
+		if err != nil {
+			return nil, err
+		}
+		if !shouldRefresh {
+			return resp, nil
+		}
+		clearStalePrimaryAppiumSession(dev, primarySessionID)
+		dev.GetLogger().LogWarn("appium_interact", fmt.Sprintf("Primary Appium session `%s` is stale for device `%s`, falling back to control session for `%s`", primarySessionID, dev.GetUDID(), script))
+	}
+
+	if !dev.GetIsAppiumUp() {
+		return nil, fmt.Errorf("Appium is not ready for device %s", dev.GetUDID())
+	}
+
+	sessionID, err := getOrCreateControlAppiumSessionID(dev)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, shouldRefresh, err := executeIOSScriptViaAppiumSession(dev, sessionID, script, args)
+	if err != nil {
+		return nil, err
+	}
+	if !shouldRefresh {
+		return resp, nil
+	}
+
+	dev.GetLogger().LogWarn("appium_interact", fmt.Sprintf("Control Appium session `%s` became invalid for device `%s` while running `%s`, recreating", sessionID, dev.GetUDID(), script))
+	deleteControlAppiumSession(dev)
+
+	sessionID, err = getOrCreateControlAppiumSessionID(dev)
+	if err != nil {
+		return nil, err
+	}
+	resp, _, err = executeIOSScriptViaAppiumSession(dev, sessionID, script, args)
+	return resp, err
 }
 
 func deviceLock(dev devices.PlatformDevice, lock string) (*http.Response, error) {
@@ -107,7 +604,21 @@ func deviceTap(dev devices.PlatformDevice, x float64, y float64) (*http.Response
 	}
 
 	if dev.GetOS() == "ios" {
-		return wdaRequest(dev, http.MethodPost, "wda/tap", bytes.NewReader(actionJSON))
+		if hasExternalAppiumSession(dev) || dev.GetIsAppiumUp() {
+			tapX, tapY, err := normalizeIOSPointForAppium(dev, x, y)
+			if err != nil {
+				return nil, err
+			}
+			resp, err := executeIOSScriptViaBestSession(dev, "mobile: tap", []map[string]any{{
+				"x": tapX,
+				"y": tapY,
+			}})
+			if err == nil {
+				return resp, nil
+			}
+			dev.GetLogger().LogWarn("appium_interact", fmt.Sprintf("Appium tap path failed for device `%s`, falling back to WDA: %v", dev.GetUDID(), err))
+		}
+		return wdaRequestWithSessionFallback(dev, http.MethodPost, "wda/tap", actionJSON, "wda/tap", actionJSON)
 	} else {
 		return androidRemoteServerRequestJson(dev, http.MethodPost, "tap", bytes.NewReader([]byte(actionJSON)))
 	}
@@ -132,7 +643,22 @@ func deviceTouchAndHold(dev devices.PlatformDevice, x float64, y float64, durati
 	}
 
 	if dev.GetOS() == "ios" {
-		return wdaRequest(dev, http.MethodPost, "wda/touchAndHold", bytes.NewReader(actionJSON))
+		if hasExternalAppiumSession(dev) || dev.GetIsAppiumUp() {
+			holdX, holdY, err := normalizeIOSPointForAppium(dev, x, y)
+			if err != nil {
+				return nil, err
+			}
+			resp, err := executeIOSScriptViaBestSession(dev, "mobile: touchAndHold", []map[string]any{{
+				"x":        holdX,
+				"y":        holdY,
+				"duration": duration,
+			}})
+			if err == nil {
+				return resp, nil
+			}
+			dev.GetLogger().LogWarn("appium_interact", fmt.Sprintf("Appium touchAndHold path failed for device `%s`, falling back to WDA: %v", dev.GetUDID(), err))
+		}
+		return wdaRequestWithSessionFallback(dev, http.MethodPost, "wda/touchAndHold", actionJSON, "wda/touchAndHold", actionJSON)
 	} else {
 		return androidRemoteServerRequestJson(dev, http.MethodPost, "touchAndHold", bytes.NewReader([]byte(actionJSON)))
 	}
@@ -175,6 +701,32 @@ func deviceScreenshot(dev devices.PlatformDevice) (string, error) {
 
 func deviceSwipe(dev devices.PlatformDevice, x, y, endX, endY float64) (*http.Response, error) {
 	if dev.GetOS() == "ios" {
+		if hasExternalAppiumSession(dev) {
+			primarySessionID := dev.GetAppiumSessionID()
+			resp, shouldRefresh, err := executeIOSSwipeViaAppiumSession(dev, primarySessionID, x, y, endX, endY)
+			if err != nil {
+				dev.GetLogger().LogWarn("appium_interact", fmt.Sprintf("Primary Appium session `%s` failed for device `%s`, falling back to control session: %v", primarySessionID, dev.GetUDID(), err))
+			} else if !shouldRefresh {
+				return resp, nil
+			} else {
+				clearStalePrimaryAppiumSession(dev, primarySessionID)
+				dev.GetLogger().LogWarn("appium_interact", fmt.Sprintf("Primary Appium session `%s` is stale for device `%s`, falling back to control session", primarySessionID, dev.GetUDID()))
+			}
+		}
+		if dev.GetIsAppiumUp() {
+			resp, err := executeIOSSwipeViaControlSession(dev, x, y, endX, endY)
+			if err == nil {
+				return resp, nil
+			}
+			dev.GetLogger().LogWarn("appium_interact", fmt.Sprintf("Control-session swipe fallback failed for device `%s`: %v", dev.GetUDID(), err))
+		}
+		if direction, ok := inferDirectionalSwipe(x, y, endX, endY); ok {
+			resp, err := tryWDADirectionalSwipe(dev, direction)
+			if err == nil {
+				return resp, nil
+			}
+			dev.GetLogger().LogWarn("wda_interact", fmt.Sprintf("Directional swipe fallback failed for device `%s`: %v", dev.GetUDID(), err))
+		}
 		requestBody := struct {
 			X     float64 `json:"startX"`
 			Y     float64 `json:"startY"`
@@ -186,13 +738,30 @@ func deviceSwipe(dev devices.PlatformDevice, x, y, endX, endY float64) (*http.Re
 			Y:     y,
 			EndX:  endX,
 			EndY:  endY,
-			Delay: 1,
+			Delay: 0.15,
 		}
 		actionJSON, err := json.MarshalIndent(requestBody, "", "  ")
 		if err != nil {
 			return nil, err
 		}
-		return wdaRequest(dev, http.MethodPost, "wda/swipe", bytes.NewReader(actionJSON))
+		sessionRequestBody := struct {
+			FromX    float64 `json:"fromX"`
+			FromY    float64 `json:"fromY"`
+			ToX      float64 `json:"toX"`
+			ToY      float64 `json:"toY"`
+			Duration float64 `json:"duration"`
+		}{
+			FromX:    x,
+			FromY:    y,
+			ToX:      endX,
+			ToY:      endY,
+			Duration: 0.15,
+		}
+		sessionActionJSON, err := json.MarshalIndent(sessionRequestBody, "", "  ")
+		if err != nil {
+			return nil, err
+		}
+		return wdaRequestWithSessionFallback(dev, http.MethodPost, "wda/swipe", actionJSON, "wda/dragfromtoforduration", sessionActionJSON)
 	} else {
 		requestBody := struct {
 			X     float64 `json:"x1"`
@@ -310,7 +879,14 @@ func activateApp(dev devices.PlatformDevice, appIdentifier string) (*http.Respon
 			return nil, fmt.Errorf("appiumActivateApp: Failed to marshal request body json when activating app for device `%s` - %s", dev.GetUDID(), err)
 		}
 
-		return wdaRequest(dev, http.MethodPost, "wda/apps/activate", bytes.NewReader(reqJson))
+		activateAppResp, err := wdaRequestWithSessionFallback(dev, http.MethodPost, "wda/apps/activate", reqJson, "wda/apps/activate", reqJson)
+		if err != nil {
+			return activateAppResp, err
+		}
+		if err := ensureSuccessfulResponse(activateAppResp, fmt.Sprintf("activating app `%s`", appIdentifier)); err != nil {
+			return activateAppResp, err
+		}
+		return activateAppResp, nil
 	}
 
 	return nil, fmt.Errorf("App activation available only for iOS devices")
@@ -351,17 +927,29 @@ func deviceGetClipboard(dev devices.PlatformDevice) (*http.Response, error) {
 }
 
 func executeTypeText(dev devices.PlatformDevice, text string) (*http.Response, error) {
-	typeTextPayload := models.AppiumTypeText{
-		Text: text,
-	}
-	typeJSON, err := json.MarshalIndent(typeTextPayload, "", "  ")
-	if err != nil {
-		return nil, err
-	}
-
 	if dev.GetOS() == "ios" {
-		return wdaRequest(dev, http.MethodPost, "wda/type", bytes.NewBuffer(typeJSON))
+		typeTextPayload := struct {
+			Value []string `json:"value"`
+		}{
+			Value: make([]string, 0, len([]rune(text))),
+		}
+		for _, char := range text {
+			typeTextPayload.Value = append(typeTextPayload.Value, string(char))
+		}
+
+		typeJSON, err := json.MarshalIndent(typeTextPayload, "", "  ")
+		if err != nil {
+			return nil, err
+		}
+		return wdaSessionRequestWithRetry(dev, http.MethodPost, "wda/keys", typeJSON)
 	} else {
+		typeTextPayload := models.AppiumTypeText{
+			Text: text,
+		}
+		typeJSON, err := json.MarshalIndent(typeTextPayload, "", "  ")
+		if err != nil {
+			return nil, err
+		}
 		andDev, ok := dev.(*devices.AndroidDevice)
 		if !ok {
 			return nil, fmt.Errorf("device %s is not an Android device", dev.GetUDID())
@@ -387,6 +975,37 @@ func getCenterCoordinates(dev devices.PlatformDevice) (float64, float64, error) 
 	}
 
 	return width / 2, height / 2, nil
+}
+
+func getIOSScreenSize(dev devices.PlatformDevice) (float64, float64, error) {
+	device := dev.GetDBDevice()
+	width, err := strconv.ParseFloat(device.ScreenWidth, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid screen width %q: %w", device.ScreenWidth, err)
+	}
+
+	height, err := strconv.ParseFloat(device.ScreenHeight, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid screen height %q: %w", device.ScreenHeight, err)
+	}
+
+	return width, height, nil
+}
+
+func normalizeIOSPointForAppium(dev devices.PlatformDevice, x, y float64) (float64, float64, error) {
+	width, height, err := getIOSScreenSize(dev)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	if x >= 0 && x <= 1 {
+		x *= width
+	}
+	if y >= 0 && y <= 1 {
+		y *= height
+	}
+
+	return x, y, nil
 }
 
 func normalizeCoordinates(dev devices.PlatformDevice, x, y float64) (float64, float64, error) {

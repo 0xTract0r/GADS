@@ -13,6 +13,33 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+type appiumPluginHeartbeat struct {
+	SessionID string `json:"session_id"`
+}
+
+func syncAppiumSessionFromRequestBody(dev devices.PlatformDevice, c *gin.Context) error {
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		return err
+	}
+	defer c.Request.Body.Close()
+
+	if len(body) == 0 {
+		return nil
+	}
+
+	var payload appiumPluginHeartbeat
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil
+	}
+
+	if payload.SessionID != "" {
+		dev.SetHasAppiumSession(true)
+		dev.SetAppiumSessionID(payload.SessionID)
+	}
+	return nil
+}
+
 // AppiumPluginLog The plugin sends all logs from the server so we can store them in Mongo without having to parse output from the exec command
 func AppiumPluginLog(c *gin.Context) {
 	udid := c.Param("udid")
@@ -40,6 +67,10 @@ func AppiumPluginLog(c *gin.Context) {
 func AppiumPluginRegister(c *gin.Context) {
 	udid := c.Param("udid")
 	if dev, ok := devices.DevManager.Get(udid); ok {
+		if err := syncAppiumSessionFromRequestBody(dev, c); err != nil {
+			api.InternalError(c, fmt.Sprintf("Failed to read Appium register request body - %s", err))
+			return
+		}
 		dev.SetAppiumLastPingTS(time.Now().UnixMilli())
 		dev.SetAppiumUp(true)
 		api.OKMessage(c, "Appium registered as up")
@@ -81,6 +112,10 @@ func AppiumPluginRemoveSession(c *gin.Context) {
 func AppiumPluginPing(c *gin.Context) {
 	udid := c.Param("udid")
 	if dev, ok := devices.DevManager.Get(udid); ok {
+		if err := syncAppiumSessionFromRequestBody(dev, c); err != nil {
+			api.InternalError(c, fmt.Sprintf("Failed to read Appium ping request body - %s", err))
+			return
+		}
 		dev.SetAppiumLastPingTS(time.Now().UnixMilli())
 		dev.SetAppiumUp(true)
 		api.OKMessage(c, "Ping for Appium server availability successful")

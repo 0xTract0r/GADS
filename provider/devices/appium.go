@@ -16,6 +16,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -47,6 +48,7 @@ func setupAppiumForDevice(d PlatformDevice) error {
 		return err
 	}
 	d.SetAppiumPort(appiumPort)
+	d.SetControlAppiumSessionID("")
 
 	caps := d.AppiumCapabilities()
 	go startAppium(d, caps)
@@ -88,6 +90,8 @@ func startAppium(d PlatformDevice, capabilities models.AppiumServerCapabilities)
 	udid := d.GetUDID()
 	appiumPort := d.GetAppiumPort()
 	capabilitiesJson, _ := json.Marshal(capabilities)
+	deviceLogDir := filepath.Join(config.ProviderConfig.ProviderFolder, fmt.Sprintf("device_%s", udid))
+	appiumLogPath := filepath.Join(deviceLogDir, "appium-server.log")
 
 	pluginConfig := models.AppiumPluginConfiguration{
 		ProviderUrl:       fmt.Sprintf("http://%s:%v", config.ProviderConfig.HostAddress, config.ProviderConfig.Port),
@@ -102,14 +106,24 @@ func startAppium(d PlatformDevice, capabilities models.AppiumServerCapabilities)
 		"-p",
 		appiumPort,
 		"--log-timestamp",
-		"--use-plugin=gads",
+		"--use-plugins=gads,",
 		fmt.Sprintf("--plugin-gads-config=%s", string(pluginConfigJson)),
 		"--session-override",
 		"--log-no-colors",
 		"--relaxed-security",
 		"--default-capabilities", string(capabilitiesJson))
+	cmd.Dir = deviceLogDir
 
-	logger.ProviderLogger.LogDebug("device_setup", fmt.Sprintf("Starting Appium on device `%s` with command `%s`", udid, cmd.Args))
+	logFile, err := os.Create(appiumLogPath)
+	if err != nil {
+		logger.ProviderLogger.LogWarn("device_setup", fmt.Sprintf("Failed to create Appium log file for device `%s` at `%s` - %v", udid, appiumLogPath, err))
+	} else {
+		defer logFile.Close()
+		cmd.Stdout = logFile
+		cmd.Stderr = logFile
+	}
+
+	logger.ProviderLogger.LogDebug("device_setup", fmt.Sprintf("Starting Appium on device `%s` in `%s` with command `%s` (log: %s)", udid, cmd.Dir, cmd.Args, appiumLogPath))
 
 	if err := cmd.Start(); err != nil {
 		logger.ProviderLogger.LogError("device_setup", fmt.Sprintf("Error executing `%s` for device `%v` - %v", cmd.Args, udid, err))
@@ -118,11 +132,22 @@ func startAppium(d PlatformDevice, capabilities models.AppiumServerCapabilities)
 	}
 
 	if err := cmd.Wait(); err != nil {
-		logger.ProviderLogger.LogError("device_setup", fmt.Sprintf(
-			"startAppium: Error waiting for `%s` command to finish, it errored out or device `%v` was disconnected - %v",
-			cmd.Args, udid, err))
+		if d.GetIsAppiumUp() {
+			logger.ProviderLogger.LogWarn("device_setup", fmt.Sprintf(
+				"Appium process for device `%v` exited after startup - %v. Keeping provider live and marking Appium unavailable. See `%s` for Appium logs.",
+				udid, err, appiumLogPath))
+			d.SetAppiumUp(false)
+			d.SetAppiumSessionID("")
+			d.SetControlAppiumSessionID("")
+			d.SetHasAppiumSession(false)
+			return
+		}
 
-		d.Reset("Appium command errored out or device was disconnected.")
+		logger.ProviderLogger.LogError("device_setup", fmt.Sprintf(
+			"startAppium: Error waiting for `%s` command to finish before startup completed, it errored out or device `%v` was disconnected - %v. See `%s` for Appium logs.",
+			cmd.Args, udid, err, appiumLogPath))
+
+		d.Reset("Appium command errored out or device was disconnected before startup completed.")
 	}
 }
 

@@ -263,15 +263,86 @@ This is an optional but a preferable step - it can make devices setup more auton
 
 #### Prepare Broadcast Extension for WebRTC video - optional
 
-GADS supports iOS devices WebRTC video stream using a Broadcast Extension to generate H264 frames from the device screen. This is currently not automatically done by GADS.
+GADS supports iOS devices WebRTC video stream using a Broadcast Extension to generate H264 frames from the device screen. This is currently not automatically done by GADS. The legacy `resources/gads-broadcast.ipa` file can be useful as a reference artifact, but iOS provisioning profiles expire, so the source project under `resources/ios-broadcast-extension` is the reproducible path.
 
-- Download `gads-broadcast.ipa` from the `resources` folder in the repository
-- Sign and install the `gads-broadcast.ipa` on your iOS devices
+- Install [XcodeGen](https://github.com/yonaskolb/XcodeGen) if the host does not already have it.
+- Generate and build the Broadcast host app. Replace the team and bundle prefix with values that match your Apple signing account:
+
+```bash
+cd resources/ios-broadcast-extension
+xcodegen generate
+xcodebuild \
+  -scheme GADSBroadcastSigning \
+  -configuration Release \
+  -destination 'generic/platform=iOS' \
+  DEVELOPMENT_TEAM=<APPLE_TEAM_ID> \
+  GADS_BROADCAST_BUNDLE_PREFIX=com.example.gads.broadcast \
+  CODE_SIGN_STYLE=Automatic \
+  build
+```
+
+- Install the built `h264-broadcast-extension.app` from Xcode's `Release-iphoneos` products folder on each iOS device, for example with Xcode Devices and Simulators or `xcrun devicectl device install app`.
 - On each device edit the Control Center and add the `Screen Recording` option
 - Tap & hold the `Screen Recording` button until the context menu with selection appears
 - Select `gads-broadcast-extension` from the menu and tap `Start Broadcast`
 - The broadcast should start in a few seconds
 - You can now start the provider instance
+
+#### iOS Broadcast Extension operating guidance
+
+The Broadcast Extension path is the current preferred low-latency iOS video path when the goal is interactive remote control. The device-side pipeline is:
+
+1. ReplayKit captures screen `CMSampleBuffer` objects in a Broadcast Upload Extension.
+2. The extension encodes frames to H264, preferably through VideoToolbox hardware encoding.
+3. The extension serves length-prefixed Annex-B H264 frames on device port `8765`.
+4. The provider forwards device port `8765` to the host, reads the H264 packets, and writes them to the iOS WebRTC Broadcast track.
+
+The checked-in extension keeps the latest ReplayKit frame in memory, forces SPS/PPS plus an IDR frame for a new TCP client, and repeats the latest frame while a client is connected. This avoids the `track-only` failure mode where a static screen creates a WebRTC track but no decodable browser video frame.
+
+This path avoids the WDA MJPEG screenshot stream and host-side FFmpeg re-encoding used by the fallback iOS WebRTC path, so it usually has much lower first-frame and interaction latency. On the iPhone XR validation device, the local baseline on 2026-04-21 was `readyState=4`, `828x1792`, and first frame around `489 ms` in the direct low-latency viewer.
+
+It is not a good unattended 24/7 default. A system-wide ReplayKit broadcast keeps the device screen active, keeps the Broadcast Upload Extension alive, and continuously captures, encodes, and sends video. This can increase battery drain and device temperature, and sustained heat can later show up as lower frame rate, higher latency, system dialogs, or the broadcast being stopped by iOS.
+
+Use this mode with the following policy:
+
+| Scenario | Recommended mode |
+| --- | --- |
+| Interactive remote control, live debugging, short operator sessions | Use `ios_webrtc_broadcast`. Keep the broadcast running while an operator is connected. |
+| Long idle periods where nobody is watching the screen | Stop the broadcast, or add an idle timer that stops it after a few minutes without an active viewer or input. |
+| Long sessions that must stay visible | Lower `stream_target_fps` first, then lower bitrate in the Broadcast Extension. Start with 15-18 fps before reducing resolution. |
+| Device gets hot, latency rises, or the device throttles | Stop the broadcast, let the phone cool, then restart at lower fps/bitrate. |
+| Highest stability over lowest latency | Use the WDA/MJPEG based iOS path instead of the Broadcast Extension path. |
+
+Recommended production guardrails:
+
+- Keep the device physically cool: remove the case, keep it ventilated, and avoid stacking phones.
+- Do not rely on a running Broadcast Extension as the only device health signal. Treat `8765` or broadcast process failure as stream health, not full device offline.
+- Add automatic idle handling before using this in a long-running device farm: start the broadcast when a viewer opens the control page, and stop or reduce fps after an idle timeout.
+- Add a thermal policy in the host app or extension when possible: on elevated thermal state, lower fps/bitrate; on critical thermal state, stop the broadcast.
+- Keep a first-frame verification that checks the real `<video>` state, not just WebRTC track arrival. Prefer `requestVideoFrameCallback` or sampled non-black pixels; at minimum require `video.readyState >= 2`, `videoWidth > 0`, and `videoHeight > 0`.
+
+If the control page shows `Waiting for video frames`, distinguish these cases before resetting the whole device:
+
+- No `gads-broadcast-extension` process: the broadcast is not running. Start it from the Screen Recording picker.
+- Provider cannot connect to forwarded port `8765`: the stream is down, but WDA/Appium may still be healthy.
+- WebRTC reaches `track-only` but `<video>` has `readyState=0`: the browser received a track but no decodable H264 keyframe. The extension must emit SPS/PPS and an IDR frame for new connections, and should repeat the latest frame when the screen is static.
+- iOS shows `Attempted to start an invalid broadcast session`: dismiss the system dialog and start a fresh broadcast session.
+
+Current alternatives and tradeoffs:
+
+| Option | Pros | Cons | Fit |
+| --- | --- | --- | --- |
+| `ios_webrtc_broadcast` with ReplayKit + H264 + WebRTC | Best current latency; browser receives H264 directly; good remote-control UX | Requires a signed app/extension and a user-started broadcast; continuous screen capture can heat the phone; not ideal as a 24/7 idle daemon | Preferred for active sessions |
+| `ios_webrtc_ffmpeg` using WDA MJPEG + host FFmpeg | No ReplayKit broadcast on the phone; easier to recover when the broadcast extension is not installed | Higher latency; WDA MJPEG and host transcoding add overhead; quality depends on WDA stream settings | Stable fallback |
+| Plain WDA MJPEG/screenshot polling | Simple and compatible with standard WDA paths | Slow and bandwidth-heavy; usually unsuitable for smooth remote control | Debug fallback only |
+| Native AirPlay/QuickTime mirroring | Can offload more work to system components | Not integrated with GADS control/session routing; harder to automate and multiplex in a device farm | Research option, not current baseline |
+
+References for the operating assumptions:
+
+- Apple ReplayKit `RPBroadcastSampleHandler` handles screen `CMSampleBuffer` objects in `RPBroadcastProcessModeSampleBuffer`: https://developer.apple.com/documentation/replaykit/rpbroadcastsamplehandler
+- Apple `ProcessInfo` thermal guidance says apps should reduce system resource usage at higher thermal states: https://developer.apple.com/documentation/foundation/processinfo
+- Twilio's ReplayKit screen-share guide describes the same Broadcast Extension model and warns that ReplayKit Broadcast Extensions have limited memory: https://www.twilio.com/docs/video/ios-v5-screen-share
+- Twilio's ReplayKit sample notes the Broadcast Extension memory limit and uses H264/format requests to reduce memory usage: https://github.com/twilio/video-quickstart-ios/blob/master/ReplayKitExample/README.md
 
 ### Android Phones
 
@@ -320,6 +391,10 @@ They will also be stored in MongoDB in DB `logs` and collection corresponding to
 
 On start a log folder and file is created for each device relative to the used provider folder - default or provided by the `--provider-folder` flag.  
 They will also be stored in MongoDB in DB `logs` and collection corresponding to the device UDID.
+
+For devices that start a local Appium server, the provider also writes the raw Appium startup/runtime output to `device_<udid>/appium-server.log` inside the provider folder. This is the first place to check when the device stays in `preparing` but provider logs only show `startAppium ... exit status 1`.
+
+If Appium fails with `argument --use-plugins: Could not read file 'gads': EISDIR`, the child process is being started from a directory where `gads` resolves to a local folder on a case-insensitive filesystem. Start Appium from a neutral provider/device folder, not from the repository root that contains `GADS/`.
 
 ### SDB - Tizen Only
 

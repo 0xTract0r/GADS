@@ -32,6 +32,8 @@ The platform architecture consists of two main components:
 - **Hub**: A web interface for remote device control and provider management.
 - **Provider**: Handles device setup and makes them available for remote access.
 
+For AI/developer handoff and current implementation status, start with [Repo Knowledge Map](./docs/repo-knowledge-map.md) and [Repo Memory Ledger](./docs/repo-memory-ledger.md).
+
 ### Why Choose GADS?
 
 - 💰 **Free**: Self-hosted alternative to AWS Device Farm and Firebase Test Lab

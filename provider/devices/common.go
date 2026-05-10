@@ -38,6 +38,8 @@ var netClient = &http.Client{
 	Timeout: time.Second * 120,
 }
 
+const iosConnectedDeviceMissResetThreshold = 5
+
 // DevManager is the primary device store holding PlatformDevice instances.
 var DevManager = NewDeviceStore()
 
@@ -297,6 +299,7 @@ func newPlatformDevice(dbDevice *models.DBDevice, deviceLogger models.CustomLogg
 func updateDevices() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
+	missedConnectionTicks := make(map[string]int)
 
 	var tizenTicker *time.Ticker
 	var tizenChan <-chan time.Time
@@ -320,9 +323,13 @@ func updateDevices() {
 				dbDevice := platDev.GetDBDevice()
 				udid := platDev.GetUDID()
 				if dbDevice.Usage == "disabled" {
+					delete(missedConnectionTicks, udid)
 					continue
 				}
 				if slices.Contains(connectedDevices, udid) {
+					if missedConnectionTicks[udid] > 0 {
+						delete(missedConnectionTicks, udid)
+					}
 					platDev.SetConnected(true)
 					state := platDev.GetProviderState()
 					if state != "preparing" && state != "live" {
@@ -333,10 +340,25 @@ func updateDevices() {
 							continue
 						}
 
+						if !platDev.TryBeginSetup() {
+							continue
+						}
+
 						setContext(platDev)
-						go platDev.Setup()
+						go func(dev PlatformDevice) {
+							defer dev.EndSetup()
+							dev.Setup()
+						}(platDev)
 					}
 				} else {
+					if dbDevice.OS == "ios" {
+						missedConnectionTicks[udid]++
+						if missedConnectionTicks[udid] < iosConnectedDeviceMissResetThreshold {
+							logger.ProviderLogger.LogWarn("device_setup", fmt.Sprintf("iOS device `%s` missed connected-device scan (%d/%d), debouncing reset", udid, missedConnectionTicks[udid], iosConnectedDeviceMissResetThreshold))
+							continue
+						}
+					}
+					delete(missedConnectionTicks, udid)
 					platDev.Reset("Device is no longer connected.")
 					platDev.SetConnected(false)
 				}

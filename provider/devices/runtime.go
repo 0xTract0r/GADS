@@ -34,6 +34,7 @@ type RuntimeState struct {
 	CtxCancel        context.CancelFunc
 	Mutex            sync.Mutex
 	SetupMutex       sync.Mutex
+	SetupInProgress  bool
 	Logger           models.CustomLogger
 	SemVer           *semver.Version
 	InitialSetupDone bool
@@ -45,18 +46,19 @@ type RuntimeState struct {
 	ProviderState string
 
 	// Provider-only runtime fields
-	HardwareModel        string
-	IsResetting          bool
-	StreamTargetFPS      int
-	StreamJpegQuality    int
-	StreamScalingFactor  int
-	AppiumLastPingTS     int64
-	AppiumSessionID      string
-	IsAppiumUp           bool
-	HasAppiumSession     bool
-	CurrentRotation      string
-	SupportedStreamTypes []models.StreamType
-	InstalledApps        []string
+	HardwareModel          string
+	IsResetting            bool
+	StreamTargetFPS        int
+	StreamJpegQuality      int
+	StreamScalingFactor    int
+	AppiumLastPingTS       int64
+	AppiumSessionID        string
+	ControlAppiumSessionID string
+	IsAppiumUp             bool
+	HasAppiumSession       bool
+	CurrentRotation        string
+	SupportedStreamTypes   []models.StreamType
+	InstalledApps          []string
 }
 
 // Common accessor implementations inherited by all platform types via embedding.
@@ -75,7 +77,11 @@ func (r *RuntimeState) GetContext() context.Context                  { return r.
 func (r *RuntimeState) GetAppiumPort() string                        { return r.AppiumPort }
 func (r *RuntimeState) SetAppiumPort(port string)                    { r.AppiumPort = port }
 func (r *RuntimeState) GetAppiumSessionID() string                   { return r.AppiumSessionID }
+func (r *RuntimeState) GetControlAppiumSessionID() string            { return r.ControlAppiumSessionID }
+func (r *RuntimeState) GetAppiumLastPingTS() int64                   { return r.AppiumLastPingTS }
+func (r *RuntimeState) GetHasAppiumSession() bool                    { return r.HasAppiumSession }
 func (r *RuntimeState) SetAppiumSessionID(id string)                 { r.AppiumSessionID = id }
+func (r *RuntimeState) SetControlAppiumSessionID(id string)          { r.ControlAppiumSessionID = id }
 func (r *RuntimeState) SetAppiumUp(up bool)                          { r.IsAppiumUp = up }
 func (r *RuntimeState) SetAppiumLastPingTS(ts int64)                 { r.AppiumLastPingTS = ts }
 func (r *RuntimeState) SetHasAppiumSession(has bool)                 { r.HasAppiumSession = has }
@@ -102,6 +108,20 @@ func (r *RuntimeState) SetNewContext(ctx context.Context, cancel context.CancelF
 	r.Context = ctx
 	r.CtxCancel = cancel
 }
+func (r *RuntimeState) TryBeginSetup() bool {
+	r.Mutex.Lock()
+	defer r.Mutex.Unlock()
+	if r.SetupInProgress {
+		return false
+	}
+	r.SetupInProgress = true
+	return true
+}
+func (r *RuntimeState) EndSetup() {
+	r.Mutex.Lock()
+	defer r.Mutex.Unlock()
+	r.SetupInProgress = false
+}
 
 // ToSyncUpdate builds the lightweight struct sent to the hub each second.
 func (r *RuntimeState) ToSyncUpdate() models.ProviderDeviceSync {
@@ -126,6 +146,11 @@ func (r *RuntimeState) ResetBase(reason string) bool {
 			r.CtxCancel()
 		}
 		r.ProviderState = "init"
+		r.AppiumSessionID = ""
+		r.ControlAppiumSessionID = ""
+		r.HasAppiumSession = false
+		r.IsAppiumUp = false
+		r.AppiumLastPingTS = 0
 		r.IsResetting = false
 
 		// Free AppiumPort (common to all platforms)
