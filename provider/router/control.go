@@ -604,20 +604,36 @@ func deviceTap(dev devices.PlatformDevice, x float64, y float64) (*http.Response
 	}
 
 	if dev.GetOS() == "ios" {
+		// Fast path：直连 WDA sessionless tap。配合 ios.go 的
+		// snapshotMaxDepth=0/snapshotMaxChildren=1 设置，单次 tap 通常落在 10~30ms。
+		// 浏览器/Hub 控制页直接发像素坐标，WDA 接受同一坐标空间，无需额外换算。
+		resp, wdaErr := wdaRequestWithSessionFallback(dev, http.MethodPost, "wda/tap", actionJSON, "wda/tap", actionJSON)
+		if wdaErr == nil && resp != nil && resp.StatusCode < http.StatusBadRequest {
+			return resp, nil
+		}
+		if resp != nil {
+			resp.Body.Close()
+		}
+		dev.GetLogger().LogWarn("wda_interact",
+			fmt.Sprintf("WDA tap fast path failed for device `%s`, falling back to Appium: %v", dev.GetUDID(), wdaErr))
+
+		// Fallback：Appium mobile:tap。在异常状态下更宽容，但延迟更高（~700ms+）。
 		if hasExternalAppiumSession(dev) || dev.GetIsAppiumUp() {
 			tapX, tapY, err := normalizeIOSPointForAppium(dev, x, y)
 			if err != nil {
 				return nil, err
 			}
-			resp, err := executeIOSScriptViaBestSession(dev, "mobile: tap", []map[string]any{{
+			appiumResp, err := executeIOSScriptViaBestSession(dev, "mobile: tap", []map[string]any{{
 				"x": tapX,
 				"y": tapY,
 			}})
 			if err == nil {
-				return resp, nil
+				return appiumResp, nil
 			}
-			dev.GetLogger().LogWarn("appium_interact", fmt.Sprintf("Appium tap path failed for device `%s`, falling back to WDA: %v", dev.GetUDID(), err))
+			dev.GetLogger().LogWarn("appium_interact",
+				fmt.Sprintf("Appium tap fallback also failed for device `%s`: %v", dev.GetUDID(), err))
 		}
+		// Last resort：再走一次 WDA，与原始实现的兜底返回保持一致。
 		return wdaRequestWithSessionFallback(dev, http.MethodPost, "wda/tap", actionJSON, "wda/tap", actionJSON)
 	} else {
 		return androidRemoteServerRequestJson(dev, http.MethodPost, "tap", bytes.NewReader([]byte(actionJSON)))
@@ -643,21 +659,35 @@ func deviceTouchAndHold(dev devices.PlatformDevice, x float64, y float64, durati
 	}
 
 	if dev.GetOS() == "ios" {
+		// Fast path：WDA sessionless touchAndHold；像素坐标无需换算。
+		resp, wdaErr := wdaRequestWithSessionFallback(dev, http.MethodPost, "wda/touchAndHold", actionJSON, "wda/touchAndHold", actionJSON)
+		if wdaErr == nil && resp != nil && resp.StatusCode < http.StatusBadRequest {
+			return resp, nil
+		}
+		if resp != nil {
+			resp.Body.Close()
+		}
+		dev.GetLogger().LogWarn("wda_interact",
+			fmt.Sprintf("WDA touchAndHold fast path failed for device `%s`, falling back to Appium: %v", dev.GetUDID(), wdaErr))
+
+		// Fallback：Appium mobile:touchAndHold（更宽容但延迟更高）。
 		if hasExternalAppiumSession(dev) || dev.GetIsAppiumUp() {
 			holdX, holdY, err := normalizeIOSPointForAppium(dev, x, y)
 			if err != nil {
 				return nil, err
 			}
-			resp, err := executeIOSScriptViaBestSession(dev, "mobile: touchAndHold", []map[string]any{{
+			appiumResp, err := executeIOSScriptViaBestSession(dev, "mobile: touchAndHold", []map[string]any{{
 				"x":        holdX,
 				"y":        holdY,
 				"duration": duration,
 			}})
 			if err == nil {
-				return resp, nil
+				return appiumResp, nil
 			}
-			dev.GetLogger().LogWarn("appium_interact", fmt.Sprintf("Appium touchAndHold path failed for device `%s`, falling back to WDA: %v", dev.GetUDID(), err))
+			dev.GetLogger().LogWarn("appium_interact",
+				fmt.Sprintf("Appium touchAndHold fallback also failed for device `%s`: %v", dev.GetUDID(), err))
 		}
+		// Last resort：再走一次 WDA。
 		return wdaRequestWithSessionFallback(dev, http.MethodPost, "wda/touchAndHold", actionJSON, "wda/touchAndHold", actionJSON)
 	} else {
 		return androidRemoteServerRequestJson(dev, http.MethodPost, "touchAndHold", bytes.NewReader([]byte(actionJSON)))
@@ -701,32 +731,7 @@ func deviceScreenshot(dev devices.PlatformDevice) (string, error) {
 
 func deviceSwipe(dev devices.PlatformDevice, x, y, endX, endY float64) (*http.Response, error) {
 	if dev.GetOS() == "ios" {
-		if hasExternalAppiumSession(dev) {
-			primarySessionID := dev.GetAppiumSessionID()
-			resp, shouldRefresh, err := executeIOSSwipeViaAppiumSession(dev, primarySessionID, x, y, endX, endY)
-			if err != nil {
-				dev.GetLogger().LogWarn("appium_interact", fmt.Sprintf("Primary Appium session `%s` failed for device `%s`, falling back to control session: %v", primarySessionID, dev.GetUDID(), err))
-			} else if !shouldRefresh {
-				return resp, nil
-			} else {
-				clearStalePrimaryAppiumSession(dev, primarySessionID)
-				dev.GetLogger().LogWarn("appium_interact", fmt.Sprintf("Primary Appium session `%s` is stale for device `%s`, falling back to control session", primarySessionID, dev.GetUDID()))
-			}
-		}
-		if dev.GetIsAppiumUp() {
-			resp, err := executeIOSSwipeViaControlSession(dev, x, y, endX, endY)
-			if err == nil {
-				return resp, nil
-			}
-			dev.GetLogger().LogWarn("appium_interact", fmt.Sprintf("Control-session swipe fallback failed for device `%s`: %v", dev.GetUDID(), err))
-		}
-		if direction, ok := inferDirectionalSwipe(x, y, endX, endY); ok {
-			resp, err := tryWDADirectionalSwipe(dev, direction)
-			if err == nil {
-				return resp, nil
-			}
-			dev.GetLogger().LogWarn("wda_interact", fmt.Sprintf("Directional swipe fallback failed for device `%s`: %v", dev.GetUDID(), err))
-		}
+		// 预先准备 WDA sessionless / session swipe 的 payload，避免在快路径里重复 marshal。
 		requestBody := struct {
 			X     float64 `json:"startX"`
 			Y     float64 `json:"startY"`
@@ -761,6 +766,50 @@ func deviceSwipe(dev devices.PlatformDevice, x, y, endX, endY float64) (*http.Re
 		if err != nil {
 			return nil, err
 		}
+
+		// Fast path 1：方向明确的拖拽优先走 WDA directional swipe，开销更低。
+		if direction, ok := inferDirectionalSwipe(x, y, endX, endY); ok {
+			resp, err := tryWDADirectionalSwipe(dev, direction)
+			if err == nil {
+				return resp, nil
+			}
+			dev.GetLogger().LogWarn("wda_interact",
+				fmt.Sprintf("Directional WDA swipe fast path failed for device `%s`, falling back to coordinate swipe: %v", dev.GetUDID(), err))
+		}
+
+		// Fast path 2：WDA sessionless 坐标 swipe；与 tap 相同的快路径。
+		if resp, wdaErr := wdaRequestWithSessionFallback(dev, http.MethodPost, "wda/swipe", actionJSON, "wda/dragfromtoforduration", sessionActionJSON); wdaErr == nil && resp != nil && resp.StatusCode < http.StatusBadRequest {
+			return resp, nil
+		} else {
+			if resp != nil {
+				resp.Body.Close()
+			}
+			dev.GetLogger().LogWarn("wda_interact",
+				fmt.Sprintf("WDA coordinate swipe fast path failed for device `%s`, falling back to Appium: %v", dev.GetUDID(), wdaErr))
+		}
+
+		// Fallback A：Appium primary session（如果存在）。
+		if hasExternalAppiumSession(dev) {
+			primarySessionID := dev.GetAppiumSessionID()
+			resp, shouldRefresh, err := executeIOSSwipeViaAppiumSession(dev, primarySessionID, x, y, endX, endY)
+			if err != nil {
+				dev.GetLogger().LogWarn("appium_interact", fmt.Sprintf("Primary Appium session `%s` failed for device `%s`, falling back to control session: %v", primarySessionID, dev.GetUDID(), err))
+			} else if !shouldRefresh {
+				return resp, nil
+			} else {
+				clearStalePrimaryAppiumSession(dev, primarySessionID)
+				dev.GetLogger().LogWarn("appium_interact", fmt.Sprintf("Primary Appium session `%s` is stale for device `%s`, falling back to control session", primarySessionID, dev.GetUDID()))
+			}
+		}
+		// Fallback B：Appium control session。
+		if dev.GetIsAppiumUp() {
+			resp, err := executeIOSSwipeViaControlSession(dev, x, y, endX, endY)
+			if err == nil {
+				return resp, nil
+			}
+			dev.GetLogger().LogWarn("appium_interact", fmt.Sprintf("Control-session swipe fallback failed for device `%s`: %v", dev.GetUDID(), err))
+		}
+		// Last resort：再走一次 WDA，与原始实现的兜底返回保持一致。
 		return wdaRequestWithSessionFallback(dev, http.MethodPost, "wda/swipe", actionJSON, "wda/dragfromtoforduration", sessionActionJSON)
 	} else {
 		requestBody := struct {

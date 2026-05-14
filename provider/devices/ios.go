@@ -478,6 +478,14 @@ func (d *IOSDevice) UpdateStreamSettingsOnDevice() error {
 		// 这些等待会直接放大 tap/swipe 延迟，当前场景优先响应速度。
 		"waitForIdleTimeout":      0,
 		"animationCoolOffTimeout": 0,
+		// snapshotMaxDepth=0 / snapshotMaxChildren=1 关闭 XCUITest 默认的全量 UI 树快照
+		// （默认 snapshotMaxDepth=50，单次快照在 iOS 18 上约耗费 600~1000ms），
+		// 这是把 WDA tap/swipe 压到 <50ms 的关键。
+		// 副作用：通过 XPath / accessibility id 查找元素会得到空树，因此
+		// 该 provider 仅用于远程控制（Hub 控制页直接发坐标）；自动化场景请走
+		// /grid，它会启动独立的 WDA session 并使用各自的 settings。
+		"snapshotMaxDepth":    0,
+		"snapshotMaxChildren": 1,
 	}
 	requestBody, err := json.Marshal(map[string]any{"settings": requestSettings})
 	if err != nil {
