@@ -15,7 +15,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -470,18 +469,21 @@ func (d *IOSDevice) postWDASettings(url string, requestBody []byte) (*http.Respo
 	return response, body, nil
 }
 
-// isWDAReachable 在 d.WDAPort 上做一次极短的 TCP 探测，确认 WDA 进程当前在监听。
-// 用于流模式切换触发 reset 之后，下一次请求避免打到陈旧端口拿到 connection refused。
+// isWDAReachable 通过 HTTP GET /status 探测 WDA 是否真的在服务请求。
+// 仅做 TCP dial 不够：reset 重启时 WDA 进程先 bind 端口（kernel 立即接受 SYN）
+// 但 HTTP server 还要等几秒才能真正处理请求；这个窗口里 POST 会拿到
+// "connection reset by peer"。GET /status 是 WDA 启动后就 ready 的轻量 endpoint。
 func (d *IOSDevice) isWDAReachable() bool {
 	if d.WDAPort == "" {
 		return false
 	}
-	conn, err := net.DialTimeout("tcp", "localhost:"+d.WDAPort, 500*time.Millisecond)
+	client := &http.Client{Timeout: 800 * time.Millisecond}
+	resp, err := client.Get("http://localhost:" + d.WDAPort + "/status")
 	if err != nil {
 		return false
 	}
-	conn.Close()
-	return true
+	defer resp.Body.Close()
+	return resp.StatusCode == 200
 }
 
 // waitForLiveAndRefreshPort 等待 provider_state 回到 live 且 d.WDAPort 可连。
