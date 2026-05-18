@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -469,8 +470,45 @@ func (d *IOSDevice) postWDASettings(url string, requestBody []byte) (*http.Respo
 	return response, body, nil
 }
 
+// isWDAReachable 在 d.WDAPort 上做一次极短的 TCP 探测，确认 WDA 进程当前在监听。
+// 用于流模式切换触发 reset 之后，下一次请求避免打到陈旧端口拿到 connection refused。
+func (d *IOSDevice) isWDAReachable() bool {
+	if d.WDAPort == "" {
+		return false
+	}
+	conn, err := net.DialTimeout("tcp", "localhost:"+d.WDAPort, 500*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+// waitForLiveAndRefreshPort 等待 provider_state 回到 live 且 d.WDAPort 可连。
+// reset 是异步的：handler 触发 Reset 后立即返回，新 Setup 在下一个设备扫描 tick
+// 才开始；新 WDA 端口由 allocateAndForwardPorts 写回 d.WDAPort，但需要 10-30s。
+// bounded wait，超时返回明确错误代替难懂的 "dial tcp ...: connection refused"。
+func (d *IOSDevice) waitForLiveAndRefreshPort(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if d.GetProviderState() == "live" && d.isWDAReachable() {
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("WDA still unreachable after %s (port=%v state=%s)", timeout, d.WDAPort, d.GetProviderState())
+}
+
 // UpdateStreamSettingsOnDevice updates WebDriverAgent stream settings.
 func (d *IOSDevice) UpdateStreamSettingsOnDevice() error {
+	// 流模式切换会触发 platDev.Reset() 异步重启 WDA，新进程换端口；
+	// 若上一轮 reset 还没让 d.WDAPort 刷新到新端口就拨号，会得到 connection refused。
+	// 入口先做一次端口可达探测，不可达则等设备回到 live 再继续。
+	if !d.isWDAReachable() {
+		if err := d.waitForLiveAndRefreshPort(15 * time.Second); err != nil {
+			return fmt.Errorf("UpdateStreamSettingsOnDevice: WDA not ready: %w", err)
+		}
+	}
 	requestSettings := map[string]any{
 		"mjpegServerFramerate":         d.StreamTargetFPS,
 		"mjpegServerScreenshotQuality": d.StreamJpegQuality,
@@ -713,6 +751,19 @@ func (d *IOSDevice) launchApp(bundleID string, killExisting bool) error {
 	if err != nil {
 		d.Reset("Failed to launch app with bundleID due to process control error.")
 		return fmt.Errorf("failed to launch app with bundleID `%s` - %s", bundleID, err)
+	}
+	return nil
+}
+
+// ActivateApp brings an iOS app to the foreground without killing an existing process.
+func (d *IOSDevice) ActivateApp(bundleID string) error {
+	pControl, err := instruments.NewProcessControl(d.GoIOSDeviceEntry)
+	if err != nil {
+		return fmt.Errorf("failed to initiate process control - %s", err)
+	}
+
+	if _, err = pControl.LaunchAppWithArgs(bundleID, nil, nil, map[string]any{}); err != nil {
+		return fmt.Errorf("failed to activate app with bundleID `%s` - %s", bundleID, err)
 	}
 	return nil
 }
