@@ -17,7 +17,10 @@ func injectHubControlStreamModeOverlay(indexBody []byte) []byte {
 // 用户点 chip 才展开成完整切换面板；切换完成 2 秒后自动折叠回 chip。
 // 业务逻辑（/info 轮询、SSE 保活、waitForLive 状态机、MJPEG cache-bust、
 // MutationObserver/history hook 兜底重挂、token 解析、5 个切换 payload）
-// 保持与 d03b99a 一致，只动 DOM / CSS / collapse-expand 状态机。
+// 保持与 d03b99a 一致，只动 DOM 挂载位置 + 视觉边距。
+// 挂载位置：通过定位 Home/Lock/Swipe 等 SPA 按钮反推 actionGroup 容器，
+// 把 chip 追加到 phone+controls 这一行的父 Box 末尾，让 chip 出现在
+// 主操作区下方而不是顶部 back-button-bar 旁边。
 const hubControlStreamModeOverlay = `<script id="gads-stream-mode-overlay.js">
 (function () {
   "use strict";
@@ -186,19 +189,63 @@ const hubControlStreamModeOverlay = `<script id="gads-stream-mode-overlay.js">
     return parts.join(", ");
   }
 
-  function findHostContainer() {
-    // 控制页特征：URL 已经过 currentUdid 检查，这里只找稳定挂载点。
-    // 优先 .back-button-bar 的父容器；其次 #stream-div 的祖先；再次 #root 的子 MuiBox-root。
+  // findAnchor 定位挂载锚点。我们想让 chip 出现在 SPA 主操作区（phone-imitation + Home/Lock/Swipe 等
+  // 按钮组）下方，而不是顶部 .back-button-bar 旁边。
+  //
+  // SPA 结构（控制页）：
+  //   div.MuiBox-root.css-168n0eb  // contentBox：整页内容
+  //     div.MuiBox-root.css-0      // phoneRowParent：左半边（phone+controls）
+  //       div.MuiGrid.row          // phoneRow
+  //         div#phone-imitation    // 视频/canvas
+  //         div.MuiGrid.column     // actionGroup：Home/Lock/Swipe 等按钮列
+  //     div.MuiBox-root.css-0      // 右半边（其他面板）
+  //
+  // 我们把 chip 作为 phoneRowParent 的最后一个 child 挂入，这样：
+  //  - chip 处于按钮组正下方，y 远离顶部
+  //  - 水平继承左半边盒的 padding，与 phone-imitation 对齐
+  //  - 不挤占右半边其他面板
+  //
+  // 返回 { host, mode }：
+  //   mode = "after-phone-row"：把 chip 追加到 host 末尾（host 即 phoneRowParent）
+  //   mode = "after-back-bar" : 兜底，老的"插到 host 顶端 / back-bar 之后"行为
+  function findAnchor() {
+    // 通过定位 Home/Lock/Swipe 按钮反推 actionGroup -> phoneRow -> phoneRowParent。
+    // 用文本匹配比 CSS class hash 更稳：MUI 的 css-xxxx 在版本/build 变化时会变。
+    var btns = document.querySelectorAll("button");
+    var actionBtn = null;
+    for (var i = 0; i < btns.length; i++) {
+      var t = (btns[i].textContent || "").trim().toLowerCase();
+      if (t === "home" || t === "lock" || t === "unlock" || t === "swipe") {
+        actionBtn = btns[i];
+        break;
+      }
+    }
+    if (actionBtn && actionBtn.parentElement && actionBtn.parentElement.parentElement) {
+      var actionRow = actionBtn.parentElement;          // .css-1n5khr6
+      var actionGroup = actionRow.parentElement;         // .css-1fomzqn (column container)
+      var phoneRow = actionGroup.parentElement;          // .css-1grpfaw (row)
+      var phoneRowParent = phoneRow && phoneRow.parentElement;  // .MuiBox-root.css-0
+      if (phoneRowParent) {
+        return { host: phoneRowParent, mode: "after-phone-row" };
+      }
+    }
+    // 兜底 1：找 #phone-imitation 的祖先 row 的父
+    var phone = document.getElementById("phone-imitation");
+    if (phone && phone.parentElement && phone.parentElement.parentElement) {
+      return { host: phone.parentElement.parentElement, mode: "after-phone-row" };
+    }
+    // 兜底 2：旧逻辑（.back-button-bar 父容器）
     var backBar = document.querySelector(".back-button-bar");
-    if (backBar && backBar.parentElement) return backBar.parentElement;
+    if (backBar && backBar.parentElement) return { host: backBar.parentElement, mode: "after-back-bar" };
+    // 兜底 3：#stream-div 的祖先 MuiBox
     var streamDiv = document.getElementById("stream-div");
     if (streamDiv) {
       var p = streamDiv;
       while (p && p !== document.body) {
-        if (p.classList && p.classList.contains("MuiBox-root") && p.parentElement && p.parentElement.id === "root") return p;
+        if (p.classList && p.classList.contains("MuiBox-root") && p.parentElement && p.parentElement.id === "root") return { host: p, mode: "after-back-bar" };
         p = p.parentElement;
       }
-      return streamDiv.parentElement;
+      if (streamDiv.parentElement) return { host: streamDiv.parentElement, mode: "after-back-bar" };
     }
     return null;
   }
@@ -230,7 +277,12 @@ const hubControlStreamModeOverlay = `<script id="gads-stream-mode-overlay.js">
     root.setAttribute("data-gads-stream-root", "true");
     root.setAttribute("data-udid", udid);
     css(root, {
-      margin: "10px 0 0 0",
+      // 与 SPA 操作按钮组（actionGroup, h≈736）保持视觉距离；
+      // 16px 上 margin 让 chip 与按钮列底部不挤在一起，下 8px 给容器底部留空。
+      margin: "16px 0 8px 0",
+      // 16px 左 padding 让 chip 与 phone-imitation 左缘视觉对齐（phone 自身 margin-left: 5px，
+      // 加上一点呼吸空间），避免 chip 紧贴卡片左缘。
+      padding: "0 0 0 5px",
       fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
       position: "relative",
       display: "block"
@@ -307,7 +359,9 @@ const hubControlStreamModeOverlay = `<script id="gads-stream-mode-overlay.js">
     css(panel, {
       display: "none", // 折叠时隐藏
       position: "absolute",
-      top: "36px",
+      // chip 现在挂在主操作区下方（y≈860），向下展开会出 viewport；改为向上展开
+      // bottom: chip 上方 6px 留缝；left 与 chip 对齐
+      bottom: "36px",
       left: "0",
       zIndex: "20",
       minWidth: "320px",
@@ -318,20 +372,21 @@ const hubControlStreamModeOverlay = `<script id="gads-stream-mode-overlay.js">
       background: "#11161d",
       color: "#eef3f8",
       fontSize: "13px",
-      boxShadow: "0 8px 24px rgba(0,0,0,0.32)"
+      boxShadow: "0 -8px 24px rgba(0,0,0,0.32)"
     });
 
-    // popover 小箭头，让 panel 看起来像 chip 的弹层
+    // popover 小箭头，让 panel 看起来像 chip 的弹层；
+    // panel 从下往上展开，所以箭头放在 panel 底部、指向 chip
     var arrow = document.createElement("span");
     css(arrow, {
       position: "absolute",
-      top: "-6px",
+      bottom: "-6px",
       left: "18px",
       width: "10px",
       height: "10px",
       background: "#11161d",
-      borderLeft: "1px solid rgba(0,0,0,0.18)",
-      borderTop: "1px solid rgba(0,0,0,0.18)",
+      borderRight: "1px solid rgba(0,0,0,0.18)",
+      borderBottom: "1px solid rgba(0,0,0,0.18)",
       transform: "rotate(45deg)"
     });
     panel.appendChild(arrow);
@@ -849,24 +904,32 @@ const hubControlStreamModeOverlay = `<script id="gads-stream-mode-overlay.js">
       // 超过 deadline 还没 token 就放弃这一轮
       return;
     }
-    var host = findHostContainer();
-    if (!host) return;
+    var anchor = findAnchor();
+    if (!anchor || !anchor.host) return;
+    var host = anchor.host;
 
     var existing = document.getElementById(ROOT_ID);
     if (existing && existing.getAttribute("data-udid") === udid && activePanel && activePanel.el === existing) {
-      // 还在 DOM 里：什么都不做
-      return;
+      // 已挂载且 udid 未变：检查是否仍在期望位置；不在则重挂以避免漂移
+      var expectedParent = (anchor.mode === "after-phone-row") ? host : host;
+      if (existing.parentNode === expectedParent) return;
     }
     if (existing && existing.parentNode) existing.parentNode.removeChild(existing);
 
     var panel = new ControlPanel(udid);
 
-    // 挂在 .back-button-bar 之后；没有时挂到 host 顶端
-    var backBar = host.querySelector(".back-button-bar");
-    if (backBar && backBar.parentNode === host) {
-      backBar.insertAdjacentElement("afterend", panel.el);
+    if (anchor.mode === "after-phone-row") {
+      // 把 chip 追加到 phoneRowParent 末尾，让它出现在 phone+controls 块下方，
+      // 远离顶部、对齐主操作区。
+      host.appendChild(panel.el);
     } else {
-      host.insertBefore(panel.el, host.firstChild);
+      // 兜底：旧的"插到 .back-button-bar 之后；否则 host 顶端"行为
+      var backBar = host.querySelector(".back-button-bar");
+      if (backBar && backBar.parentNode === host) {
+        backBar.insertAdjacentElement("afterend", panel.el);
+      } else {
+        host.insertBefore(panel.el, host.firstChild);
+      }
     }
     activePanel = panel;
     lastUdid = udid;
