@@ -13,19 +13,39 @@ func injectHubControlStreamModeOverlay(indexBody []byte) []byte {
 }
 
 // hubControlStreamModeOverlay 注入到 SPA index.html 的 </body> 之前。
-// 它在 /devices/control/:udid 页面下，把一个 inline 面板挂到 .back-button-bar 之后，
-// 显示当前 stream 模式、轮询 /info、提供切换按钮并在 reprovision 期间给出实时反馈。
+// 控制页 /devices/control/:udid 下挂一个紧凑 chip（默认折叠态），
+// 用户点 chip 才展开成完整切换面板；切换完成 2 秒后自动折叠回 chip。
+// 业务逻辑（/info 轮询、SSE 保活、waitForLive 状态机、MJPEG cache-bust、
+// MutationObserver/history hook 兜底重挂、token 解析、5 个切换 payload）
+// 保持与 d03b99a 一致，只动 DOM / CSS / collapse-expand 状态机。
 const hubControlStreamModeOverlay = `<script id="gads-stream-mode-overlay.js">
 (function () {
   "use strict";
 
+  var ROOT_ID = "gads-stream-mode-overlay";
+  var CHIP_ID = "gads-stream-mode-chip";
   var PANEL_ID = "gads-stream-mode-panel";
+  var CLOSE_ID = "gads-stream-mode-close";
   var POLL_INFO_MS = 3000;
   var SWITCH_POLL_MS = 2000;
   var SWITCH_TIMEOUT_MS = 90000;
   var TOKEN_DEADLINE_MS = 30000;
+  var AUTO_COLLAPSE_DELAY_MS = 2000;
   var startedAt = Date.now();
   var MJPEG_IMG_SELECTOR = "img#image-stream, img[src*='ios-stream-mjpeg'], img[src*='mjpeg-stream']";
+
+  var COLOR_CHIP_IDLE_BG = "#1c2530";
+  var COLOR_CHIP_IDLE_BORDER = "rgba(255,255,255,0.16)";
+  var COLOR_CHIP_HOVER_BG = "#26323f";
+  var COLOR_CHIP_BUSY_BG = "#ddb866";
+  var COLOR_CHIP_BUSY_BORDER = "#b48a3a";
+  var COLOR_CHIP_BUSY_FG = "#241a05";
+  var COLOR_CHIP_OK_BG = "#1f7a4a";
+  var COLOR_CHIP_OK_BORDER = "#1f9d55";
+  var COLOR_CHIP_OK_FG = "#eafff3";
+  var COLOR_CHIP_ERR_BG = "#5a1d1d";
+  var COLOR_CHIP_ERR_BORDER = "#c84444";
+  var COLOR_CHIP_ERR_FG = "#ffecec";
 
   var BROADCAST_CANDIDATES = [
     "com.cory2btc.h264-broadcast-extension",
@@ -198,40 +218,161 @@ const hubControlStreamModeOverlay = `<script id="gads-stream-mode-overlay.js">
     var self = this;
     self.udid = udid;
     self.busy = false;
+    self.expanded = false;
     self.lastInfo = null;
     self.buttons = {};
+    self.chipState = "idle"; // idle | busy | ok | error
+    self.autoCollapseTimer = null;
 
+    // 顶层容器，保持 ROOT_ID，方便兼容旧测试选择器
     var root = document.createElement("div");
-    root.id = PANEL_ID;
+    root.id = ROOT_ID;
+    root.setAttribute("data-gads-stream-root", "true");
     root.setAttribute("data-udid", udid);
     css(root, {
-      margin: "12px 0 0 0",
-      padding: "10px 12px",
-      border: "1px solid rgba(0,0,0,0.12)",
-      borderRadius: "8px",
+      margin: "10px 0 0 0",
+      fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+      position: "relative",
+      display: "block"
+    });
+
+    // ===== chip（折叠态） =====
+    var chip = document.createElement("div");
+    chip.id = CHIP_ID;
+    chip.setAttribute("data-gads-stream-chip", "true");
+    chip.setAttribute("role", "button");
+    chip.setAttribute("tabindex", "0");
+    chip.setAttribute("aria-expanded", "false");
+    chip.title = "Click to change stream mode";
+    css(chip, {
+      display: "inline-flex",
+      alignItems: "center",
+      gap: "6px",
+      height: "28px",
+      lineHeight: "28px",
+      padding: "0 12px",
+      borderRadius: "999px",
+      background: COLOR_CHIP_IDLE_BG,
+      border: "1px solid " + COLOR_CHIP_IDLE_BORDER,
+      color: "#eef3f8",
+      fontSize: "12px",
+      fontWeight: "600",
+      cursor: "pointer",
+      userSelect: "none",
+      transition: "background 0.15s ease, border-color 0.15s ease, color 0.15s ease",
+      boxSizing: "border-box",
+      whiteSpace: "nowrap",
+      maxWidth: "100%"
+    });
+
+    var chipIcon = document.createElement("span");
+    chipIcon.textContent = "▶"; // ▶
+    css(chipIcon, { fontSize: "10px", opacity: "0.7", lineHeight: "1" });
+
+    var chipLabel = document.createElement("span");
+    chipLabel.textContent = "Stream: loading…";
+    chipLabel.setAttribute("data-gads-chip-label", "true");
+    css(chipLabel, { fontSize: "12px", letterSpacing: "0.2px" });
+
+    var chipGear = document.createElement("span");
+    chipGear.textContent = "⚙"; // ⚙
+    css(chipGear, { fontSize: "12px", opacity: "0.7", marginLeft: "2px" });
+
+    chip.appendChild(chipIcon);
+    chip.appendChild(chipLabel);
+    chip.appendChild(chipGear);
+    root.appendChild(chip);
+
+    chip.addEventListener("mouseenter", function () {
+      if (self.chipState === "idle") chip.style.background = COLOR_CHIP_HOVER_BG;
+    });
+    chip.addEventListener("mouseleave", function () {
+      if (self.chipState === "idle") chip.style.background = COLOR_CHIP_IDLE_BG;
+    });
+    chip.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      self.toggleExpanded();
+    });
+    chip.addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter" || ev.key === " ") {
+        ev.preventDefault();
+        self.toggleExpanded();
+      }
+    });
+
+    // ===== panel（展开态） =====
+    var panel = document.createElement("div");
+    panel.id = PANEL_ID;
+    panel.setAttribute("data-gads-stream-panel", "true");
+    css(panel, {
+      display: "none", // 折叠时隐藏
+      position: "absolute",
+      top: "36px",
+      left: "0",
+      zIndex: "20",
+      minWidth: "320px",
+      maxWidth: "440px",
+      padding: "10px 12px 12px 12px",
+      border: "1px solid rgba(0,0,0,0.18)",
+      borderRadius: "10px",
       background: "#11161d",
       color: "#eef3f8",
-      fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
       fontSize: "13px",
-      boxShadow: "0 4px 14px rgba(0,0,0,0.18)"
+      boxShadow: "0 8px 24px rgba(0,0,0,0.32)"
     });
+
+    // popover 小箭头，让 panel 看起来像 chip 的弹层
+    var arrow = document.createElement("span");
+    css(arrow, {
+      position: "absolute",
+      top: "-6px",
+      left: "18px",
+      width: "10px",
+      height: "10px",
+      background: "#11161d",
+      borderLeft: "1px solid rgba(0,0,0,0.18)",
+      borderTop: "1px solid rgba(0,0,0,0.18)",
+      transform: "rotate(45deg)"
+    });
+    panel.appendChild(arrow);
 
     var header = document.createElement("div");
     css(header, { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", marginBottom: "8px" });
     var title = document.createElement("div");
     title.textContent = "Stream Mode";
-    css(title, { fontWeight: "700", fontSize: "14px" });
+    css(title, { fontWeight: "700", fontSize: "13px" });
+    var closeBtn = document.createElement("button");
+    closeBtn.id = CLOSE_ID;
+    closeBtn.type = "button";
+    closeBtn.setAttribute("data-gads-stream-close", "true");
+    closeBtn.setAttribute("aria-label", "Close stream mode panel");
+    closeBtn.textContent = "×"; // ×
+    css(closeBtn, {
+      border: "none",
+      background: "transparent",
+      color: "#a6b2bf",
+      fontSize: "18px",
+      lineHeight: "1",
+      cursor: "pointer",
+      padding: "0 4px"
+    });
+    closeBtn.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      self.collapse();
+    });
+    header.appendChild(title);
+    header.appendChild(closeBtn);
+    panel.appendChild(header);
+
     var current = document.createElement("div");
     current.id = PANEL_ID + "-current";
     current.textContent = "Current: loading…";
-    css(current, { color: "#a6b2bf", fontSize: "12px" });
-    header.appendChild(title);
-    header.appendChild(current);
-    root.appendChild(header);
+    css(current, { color: "#a6b2bf", fontSize: "12px", marginBottom: "8px" });
+    panel.appendChild(current);
 
     var grid = document.createElement("div");
     css(grid, { display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "6px" });
-    root.appendChild(grid);
+    panel.appendChild(grid);
 
     function makeBtn(label, key, onClick, isPrimary) {
       var b = document.createElement("button");
@@ -249,7 +390,10 @@ const hubControlStreamModeOverlay = `<script id="gads-stream-mode-overlay.js">
         cursor: "pointer",
         textAlign: "center"
       });
-      b.addEventListener("click", onClick);
+      b.addEventListener("click", function (ev) {
+        ev.stopPropagation();
+        onClick();
+      });
       grid.appendChild(b);
       return b;
     }
@@ -263,20 +407,58 @@ const hubControlStreamModeOverlay = `<script id="gads-stream-mode-overlay.js">
     status.id = PANEL_ID + "-status";
     css(status, { marginTop: "8px", fontSize: "12px", color: "#a6b2bf", minHeight: "16px", lineHeight: "1.35" });
     status.textContent = "";
-    root.appendChild(status);
+    panel.appendChild(status);
 
     var hint = document.createElement("div");
     css(hint, { marginTop: "6px", fontSize: "11px", color: "#6b7480", lineHeight: "1.3" });
     hint.textContent = "Broadcast requires iOS Screen Recording → Start Broadcast on the device.";
-    root.appendChild(hint);
+    panel.appendChild(hint);
+
+    // 点击 panel 内部不要冒泡到 document（避免触发 outside click 折叠）
+    panel.addEventListener("click", function (ev) { ev.stopPropagation(); });
+
+    root.appendChild(panel);
 
     self.el = root;
+    self.chipEl = chip;
+    self.chipLabelEl = chipLabel;
+    self.chipIconEl = chipIcon;
+    self.chipGearEl = chipGear;
+    self.panelEl = panel;
+    self.closeBtn = closeBtn;
     self.statusEl = status;
     self.currentEl = current;
   }
 
   ControlPanel.prototype.setStatus = function (text) {
     if (this.statusEl) this.statusEl.textContent = text || "";
+  };
+
+  ControlPanel.prototype.setChipState = function (state, label) {
+    this.chipState = state;
+    var bg = COLOR_CHIP_IDLE_BG;
+    var border = COLOR_CHIP_IDLE_BORDER;
+    var fg = "#eef3f8";
+    var gearOpacity = "0.7";
+    if (state === "busy") {
+      bg = COLOR_CHIP_BUSY_BG;
+      border = COLOR_CHIP_BUSY_BORDER;
+      fg = COLOR_CHIP_BUSY_FG;
+      gearOpacity = "0.4";
+    } else if (state === "ok") {
+      bg = COLOR_CHIP_OK_BG;
+      border = COLOR_CHIP_OK_BORDER;
+      fg = COLOR_CHIP_OK_FG;
+    } else if (state === "error") {
+      bg = COLOR_CHIP_ERR_BG;
+      border = COLOR_CHIP_ERR_BORDER;
+      fg = COLOR_CHIP_ERR_FG;
+    }
+    this.chipEl.style.background = bg;
+    this.chipEl.style.borderColor = border;
+    this.chipEl.style.color = fg;
+    this.chipGearEl.style.opacity = gearOpacity;
+    if (label != null) this.chipLabelEl.textContent = label;
   };
 
   ControlPanel.prototype.setBusy = function (busy, reason) {
@@ -287,13 +469,26 @@ const hubControlStreamModeOverlay = `<script id="gads-stream-mode-overlay.js">
     }.bind(this));
     if (busy) {
       this.setStatus(reason || "Working…");
+      this.setChipState("busy", reason || "Switching…");
     }
+  };
+
+  ControlPanel.prototype.updateChipFromInfo = function (info) {
+    if (this.busy) return; // busy 期间由 setBusy 控制
+    if (!info || !info.stream_type) {
+      this.setChipState("idle", "Stream: unknown");
+      return;
+    }
+    var matched = matchMode(info);
+    var preset = matched ? matched.label : info.stream_type;
+    this.setChipState(this.chipState === "ok" ? "ok" : "idle", "Stream: " + preset);
   };
 
   ControlPanel.prototype.renderCurrent = function (info) {
     this.lastInfo = info;
     if (!info || !info.stream_type) {
       this.currentEl.textContent = "Current: unknown";
+      this.updateChipFromInfo(info);
       return;
     }
     var matched = matchMode(info);
@@ -309,6 +504,48 @@ const hubControlStreamModeOverlay = `<script id="gads-stream-mode-overlay.js">
       b.style.borderColor = active ? "#1f9d55" : "rgba(255,255,255,0.12)";
       b.style.fontWeight = active ? "800" : "600";
     });
+    this.updateChipFromInfo(info);
+  };
+
+  ControlPanel.prototype.expand = function () {
+    if (this.expanded) return;
+    this.expanded = true;
+    this.panelEl.style.display = "block";
+    this.chipEl.setAttribute("aria-expanded", "true");
+    this.chipIconEl.textContent = "▼"; // ▼
+    // 清掉可能在排队的自动折叠
+    if (this.autoCollapseTimer) {
+      clearTimeout(this.autoCollapseTimer);
+      this.autoCollapseTimer = null;
+    }
+  };
+
+  ControlPanel.prototype.collapse = function () {
+    if (!this.expanded) return;
+    this.expanded = false;
+    this.panelEl.style.display = "none";
+    this.chipEl.setAttribute("aria-expanded", "false");
+    this.chipIconEl.textContent = "▶"; // ▶
+    if (this.autoCollapseTimer) {
+      clearTimeout(this.autoCollapseTimer);
+      this.autoCollapseTimer = null;
+    }
+  };
+
+  ControlPanel.prototype.toggleExpanded = function () {
+    if (this.expanded) this.collapse(); else this.expand();
+  };
+
+  ControlPanel.prototype.scheduleAutoCollapse = function () {
+    var self = this;
+    if (self.autoCollapseTimer) clearTimeout(self.autoCollapseTimer);
+    self.autoCollapseTimer = setTimeout(function () {
+      self.autoCollapseTimer = null;
+      // 切换中或者出错时不要折叠（错误态 setChipState 会留在 error）
+      if (self.busy) return;
+      if (self.chipState === "error") return;
+      self.collapse();
+    }, AUTO_COLLAPSE_DELAY_MS);
   };
 
   // SSE 推的 entry 用于让 hub.AvailableDevicesSSE tick 把 device.Available=true，
@@ -461,10 +698,13 @@ const hubControlStreamModeOverlay = `<script id="gads-stream-mode-overlay.js">
         var waited = Math.round((Date.now() - startedAt) / 1000);
         var label = providerLive ? "Live but stream still " + (streamType || "?") + " (" + waited + "s)" : "Reprovisioning… (" + waited + "s)";
         self.setStatus(label);
+        // 切换中 chip 文本同步进度（保持 busy 黄色）
+        self.chipLabelEl.textContent = "Switching… " + waited + "s";
         return new Promise(function (r) { setTimeout(r, SWITCH_POLL_MS); }).then(step);
       }).catch(function (err) {
         var waited = Math.round((Date.now() - startedAt) / 1000);
         self.setStatus("Reprovisioning… (" + waited + "s, " + (err.message || err) + ")");
+        self.chipLabelEl.textContent = "Switching… " + waited + "s";
         return new Promise(function (r) { setTimeout(r, SWITCH_POLL_MS); }).then(step);
       });
     }
@@ -480,6 +720,8 @@ const hubControlStreamModeOverlay = `<script id="gads-stream-mode-overlay.js">
     // 但仍等待至少一次 SSE confirm
     var sameType = current.stream_type === mode.payload.stream_type;
     self.setBusy(true, "Switching to " + mode.label + "…");
+    // 切换中 chip 文本立刻反映目标模式
+    self.chipLabelEl.textContent = "Switching to " + mode.label + "…";
     hub("/device/" + encodeURIComponent(udid) + "/update-stream-settings", {
       method: "POST",
       body: JSON.stringify(mode.payload)
@@ -494,6 +736,10 @@ const hubControlStreamModeOverlay = `<script id="gads-stream-mode-overlay.js">
           setTimeout(refreshMjpegImg, 200);
           setTimeout(refreshMjpegImg, 1500);
         }
+        // chip 闪一下浅绿，然后 setBusy(false) -> updateChipFromInfo 还原
+        self.setChipState("ok", "Stream: " + mode.label + " ✓");
+        // 安排自动折叠
+        self.scheduleAutoCollapse();
       });
     }).catch(function (err) {
       var msg = err && err.message ? err.message : String(err);
@@ -502,10 +748,25 @@ const hubControlStreamModeOverlay = `<script id="gads-stream-mode-overlay.js">
       } else {
         self.setStatus("Switch failed: " + msg);
       }
+      // 错误态：chip 标红，保持展开
+      self.setChipState("error", "Stream: switch failed");
     }).then(function () {
-      self.setBusy(false);
-      // 立刻刷新一次权威信息
-      self.fetchInfo();
+      self.busy = false;
+      Object.keys(self.buttons).forEach(function (k) {
+        var b = self.buttons[k];
+        if (b) b.disabled = false;
+      });
+      // 立刻刷新一次权威信息（fetchInfo 内部会 renderCurrent -> updateChipFromInfo 把 chip 还原成 idle）
+      // 但只在没有 ok/error 标态时才让它覆盖
+      var prevState = self.chipState;
+      self.fetchInfo().then(function () {
+        if (prevState === "ok") {
+          // 保留 ok 颜色直到自动折叠或 2 秒后让 updateChipFromInfo 在下一个 poll 还原
+        } else if (prevState === "error") {
+          // 保留 error 不让 fetchInfo 覆盖
+          self.setChipState("error", "Stream: switch failed");
+        }
+      });
       void sameType;
     });
   };
@@ -514,6 +775,7 @@ const hubControlStreamModeOverlay = `<script id="gads-stream-mode-overlay.js">
     if (this.busy) return;
     var self = this;
     self.setBusy(true, "Trying to open Broadcast host app…");
+    self.chipLabelEl.textContent = "Opening Broadcast app…";
     var chain = Promise.reject(new Error("no candidate tried"));
     BROADCAST_CANDIDATES.forEach(function (bundleId) {
       chain = chain.catch(function () {
@@ -527,13 +789,40 @@ const hubControlStreamModeOverlay = `<script id="gads-stream-mode-overlay.js">
     });
     chain.catch(function () {
       self.setStatus("Could not auto-open Broadcast host app. Use iOS Screen Recording picker manually.");
-    }).then(function () { self.setBusy(false); });
+      self.setChipState("error", "Stream: broadcast launch failed");
+    }).then(function () {
+      self.busy = false;
+      Object.keys(self.buttons).forEach(function (k) {
+        var b = self.buttons[k];
+        if (b) b.disabled = false;
+      });
+      // 触发一次 info 刷新，让 chip 回到当前模式
+      self.fetchInfo();
+    });
   };
 
   // ---------- mount / observer ----------
 
   var activePanel = null;
   var lastUdid = "";
+
+  // 全局 document click -> 折叠：必须在 mount 时一次性安装
+  if (!window.__gadsStreamOutsideClickInstalled) {
+    window.__gadsStreamOutsideClickInstalled = true;
+    document.addEventListener("click", function (ev) {
+      if (!activePanel || !activePanel.expanded) return;
+      var rootEl = activePanel.el;
+      if (!rootEl) return;
+      var target = ev.target;
+      if (target && rootEl.contains(target)) return;
+      activePanel.collapse();
+    }, true); // 用 capture，避免被 SPA stopPropagation 吃掉
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape" && activePanel && activePanel.expanded) {
+        activePanel.collapse();
+      }
+    });
+  }
 
   function ensureMounted() {
     var udid = currentUdid();
@@ -563,7 +852,7 @@ const hubControlStreamModeOverlay = `<script id="gads-stream-mode-overlay.js">
     var host = findHostContainer();
     if (!host) return;
 
-    var existing = document.getElementById(PANEL_ID);
+    var existing = document.getElementById(ROOT_ID);
     if (existing && existing.getAttribute("data-udid") === udid && activePanel && activePanel.el === existing) {
       // 还在 DOM 里：什么都不做
       return;
