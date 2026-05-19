@@ -977,20 +977,10 @@ func deviceGetClipboard(dev devices.PlatformDevice) (*http.Response, error) {
 
 func executeTypeText(dev devices.PlatformDevice, text string) (*http.Response, error) {
 	if dev.GetOS() == "ios" {
-		typeTextPayload := struct {
-			Value []string `json:"value"`
-		}{
-			Value: make([]string, 0, len([]rune(text))),
-		}
-		for _, char := range text {
-			typeTextPayload.Value = append(typeTextPayload.Value, string(char))
-		}
-
-		typeJSON, err := json.MarshalIndent(typeTextPayload, "", "  ")
-		if err != nil {
-			return nil, err
-		}
-		return wdaSessionRequestWithRetry(dev, http.MethodPost, "wda/keys", typeJSON)
+		// 走 per-UDID coalescer：把同时间窗内并发到达的字符合并成 1-2 次
+		// wda/keys 调用，避免 hub-ui 远程键盘逐字符 POST 时被 IPC 延迟串行化。
+		// 详见 provider/router/typing_coalescer.go。
+		return coalescedTypeTextIOS(dev, text)
 	} else {
 		typeTextPayload := models.AppiumTypeText{
 			Text: text,
