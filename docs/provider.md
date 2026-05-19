@@ -328,6 +328,50 @@ If the control page shows `Waiting for video frames`, distinguish these cases be
 - WebRTC reaches `track-only` but `<video>` has `readyState=0`: the browser received a track but no decodable H264 keyframe. The extension must emit SPS/PPS and an IDR frame for new connections, and should repeat the latest frame when the screen is static.
 - iOS shows `Attempted to start an invalid broadcast session`: dismiss the system dialog and start a fresh broadcast session.
 
+### iOS Stream Mode Switching
+
+When the Hub UI source is unavailable, the provider exposes a small local operator page for switching the active iOS stream mode:
+
+```text
+http://127.0.0.1:12000/device/<UDID>/stream-mode
+```
+
+The local Hub can also show these controls directly on the normal control page:
+
+```text
+http://127.0.0.1:10001/devices/control/<UDID>
+```
+
+Because the `hub-ui` source submodule is not accessible in this checkout, the Hub binary injects a small local overlay into the embedded React fallback page. The overlay calls the provider API on `127.0.0.1:12000` and offers `Broadcast Fast`, `MJPEG Fast`, `MJPEG Full`, and `Start Recording`.
+
+The page calls:
+
+```http
+POST /device/<UDID>/update-stream-settings
+Content-Type: application/json
+
+{
+  "stream_type": "mjpeg",
+  "target_fps": 24,
+  "jpeg_quality": 40,
+  "scaling_factor": 50
+}
+```
+
+Supported iOS `stream_type` values are:
+
+| Mode | Use when |
+| --- | --- |
+| `ios_webrtc_broadcast` | Lowest latency active control, if the ReplayKit Broadcast Extension is installed and already running. |
+| `mjpeg` | Stable JPG/MJPEG fallback, useful when Broadcast is not running or is blank. |
+| `ios_webrtc_ffmpeg` | WebRTC fallback built from WDA MJPEG plus host-side FFmpeg. |
+
+Changing `stream_type` persists the device config and triggers provider reprovisioning for that device. It does not silently start ReplayKit Broadcast on iOS. Apple requires a user/system Broadcast picker flow, so automation can only assist by launching the host app, guiding/tapping the picker when possible, then verifying the real `gads-broadcast-extension` process and browser first frame.
+
+`Start Recording` is an assist button, not a success signal. It attempts to open known Broadcast host app bundle IDs. The operator still has to complete the iOS Broadcast picker / Start Broadcast flow if iOS shows it, and the final check must confirm both the extension process and a real browser frame.
+
+For speed over image quality in MJPEG mode, lower `scaling_factor` and `jpeg_quality` first. A practical fast preset is `24 fps / JPEG 40 / scale 50`. Raising fps while keeping `scale 100` can increase CPU, USB, and browser decode load without improving control latency.
+
 Current alternatives and tradeoffs:
 
 | Option | Pros | Cons | Fit |
@@ -343,6 +387,258 @@ References for the operating assumptions:
 - Apple `ProcessInfo` thermal guidance says apps should reduce system resource usage at higher thermal states: https://developer.apple.com/documentation/foundation/processinfo
 - Twilio's ReplayKit screen-share guide describes the same Broadcast Extension model and warns that ReplayKit Broadcast Extensions have limited memory: https://www.twilio.com/docs/video/ios-v5-screen-share
 - Twilio's ReplayKit sample notes the Broadcast Extension memory limit and uses H264/format requests to reduce memory usage: https://github.com/twilio/video-quickstart-ios/blob/master/ReplayKitExample/README.md
+
+### Onboarding a New iOS Device to GADS
+
+End-to-end runbook for adding a fresh iOS device (iOS 17/18) to a running GADS instance. Each step has a verification command. If a step fails, do not skip — read the troubleshooting section at the bottom.
+
+#### Prerequisites
+
+- Four `tmux` sessions running on the host: `gads-hub`, `gads-provider-fastpath`, `gads-low-latency-viewer`, `gads-ios-tunnel`.
+- The tunnel session must run `ios tunnel start --userspace --tunnel-info-port=28100` (verify with `curl -s http://localhost:28100/tunnels`).
+- MongoDB container running. **The container name is `gads-mongodb`** (not `gads-mongo`). Verify with `docker ps --format '{{.Names}}' | grep mongo`.
+- Xcode is installed, opened at least once, with an Apple Developer account added in `Xcode → Settings → Accounts` (paid Individual/Organization team, not Free Provisioning Team).
+- The signing certificate is in the macOS keychain. Confirm with `security find-identity -v -p codesigning`. The certificate subject looks like `/UID=.../CN=Apple Development: <name> (<DEV_ID>)/OU=<TEAM_ID>/O=...`. **The `OU` field is the Team ID** to use later; the `(<DEV_ID>)` inside CN is not the team ID.
+- WDA source tree available at `.local/gads/recovered-wda/shamanec-WebDriverAgent-*/` (used by Step 9-11 to rebuild the IPA).
+- Provider's active WDA IPA at `.local/gads/provider-instance/WebDriverAgent.ipa`.
+- The device must be **unlocked and screen-on** for every `pair` step. Cable connected directly, not through a hub when possible.
+
+#### Step-by-step
+
+Replace `<UDID>` with the new device UDID. Replace `<TEAM_ID>` with the Team ID from the certificate `OU` field.
+
+**1. Discover UDID and confirm it is new**
+
+```bash
+ios list
+TOKEN=$(curl -s -X POST http://localhost:10001/authenticate \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"password"}' \
+  | python3 -c 'import json,sys;print(json.load(sys.stdin)["result"]["access_token"])')
+curl -s -H "Authorization: Bearer $TOKEN" http://localhost:10001/admin/devices \
+  | python3 -m json.tool | grep -E '"udid"|"name"'
+```
+
+Compare `ios list` UDIDs against the hub's known devices to identify the new one.
+
+**2. lockdownd pair over USB**
+
+```bash
+ios pair --udid=<UDID>
+```
+
+On the device screen, accept the **Trust This Computer** dialog and enter the passcode.
+
+Success line: `{"level":"info","msg":"Successfully paired <UDID>"}`.
+If you see `Lockdown error: PasswordProtected`, the device screen is locked — unlock it and rerun.
+
+**3. CoreDevice pair (activates the Developer Mode toggle on the device)**
+
+```bash
+xcrun devicectl list devices                                   # confirm new device is "available" (unpaired)
+xcrun devicectl manage pair --device <UDID> --timeout 300
+```
+
+The device screen will show a second pairing prompt. Accept and enter the passcode again.
+
+Verify:
+
+```bash
+xcrun devicectl list devices | grep <UDID-prefix>              # expect "available (paired)"
+```
+
+Without this CoreDevice pairing, the `Developer Mode` toggle will not appear on the device.
+
+**4. Enable Developer Mode on the device**
+
+Physical interaction on the device:
+
+1. `Settings → Privacy & Security` → scroll to the bottom → tap `Developer Mode`.
+2. Toggle on. Device asks to restart. Restart.
+3. After reboot, unlock the device. iOS prompts "Turn on Developer Mode?". Tap **Turn On** and enter the passcode.
+
+Verify from the host:
+
+```bash
+ios devmode get --udid=<UDID>                                  # "Developer mode enabled: true"
+xcrun devicectl device info details --device <UDID> \
+  --json-output /tmp/dm.json --quiet \
+  && python3 -c 'import json;print(json.load(open("/tmp/dm.json"))["result"]["deviceProperties"]["developerModeStatus"])'
+# expect: enabled
+```
+
+**5. Re-pair after the reboot**
+
+iOS 17/18 wipes the lockdownd USB pair record after the Developer-Mode-induced reboot.
+
+```bash
+ios pair --udid=<UDID>
+```
+
+A new Trust dialog appears on the device. Accept + passcode again. Without this step, the provider will loop on `Please accept the PairingDialog`.
+
+**6. Register the device in the hub**
+
+Use an existing same-model device record as the template (run the `admin/devices` GET from Step 1 again to fetch one). For an iPhone SE 2nd/3rd gen the screen is `375 × 667`. Copy `workspace_id` from an existing device — do not hard-code.
+
+```bash
+curl -s -X POST http://localhost:10001/admin/device \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "udid": "<UDID>",
+    "name": "<Display Name>",
+    "os": "ios",
+    "os_version": "<X.Y.Z>",
+    "ip_address": "",
+    "provider": "<your-provider-nickname>",
+    "screen_width": "<W>",
+    "screen_height": "<H>",
+    "device_type": "real",
+    "stream_type": "mjpeg",
+    "usage": "enabled",
+    "use_webrtc_video": false,
+    "workspace_id": "<copy-from-existing-device>"
+  }'
+
+# Verify
+docker exec gads-mongodb mongosh --quiet gads \
+  --eval "db.new_devices.findOne({udid:'<UDID>'})"
+```
+
+**7. Check whether the active WDA IPA already provisions this device**
+
+```bash
+mkdir -p /tmp/wda-check && cd /tmp/wda-check
+unzip -qo /Users/corylin/Project/ai/ios-farm/.local/gads/provider-instance/WebDriverAgent.ipa
+python3 - <<'PYINNER'
+import plistlib, subprocess
+data = subprocess.check_output(["security","cms","-D","-i",
+  "./Payload/WebDriverAgentRunner-Runner.app/embedded.mobileprovision"])
+p = plistlib.loads(data)
+print("Profile :", p.get("Name"))
+print("Expires :", p.get("ExpirationDate"))
+print("Devices :", p.get("ProvisionedDevices"))
+PYINNER
+```
+
+- If the new UDID is already in `ProvisionedDevices` **and** the profile has not expired → skip to Step 12.
+- Otherwise continue with Steps 8-11 to rebuild and replace the IPA.
+
+**8. Pause the provider's retry loop for this device**
+
+The provider re-runs setup roughly once per second on failure. Each attempt sends a fresh pairing/install request, which iOS throttles after a few rapid requests, suppressing Trust dialogs and adding minutes of false negatives. Disable the device before manual work:
+
+```bash
+docker exec gads-mongodb mongosh --quiet gads \
+  --eval "db.new_devices.updateOne({udid:'<UDID>'},{\$set:{usage:'disabled'}})"
+sleep 15
+grep <UDID> /Users/corylin/Project/ai/ios-farm/.local/gads/provider-instance/provider.log | tail -3
+# expect: no new lines after the disable timestamp
+```
+
+**9. Register the device on the Apple Developer Portal (one-time Xcode GUI step)**
+
+`xcodebuild -allowProvisioningUpdates` cannot register a new device from the CLI unless an App Store Connect API key is configured. The simplest path is the Xcode GUI, one minute total:
+
+1. Open the WDA project:
+   ```bash
+   WDA=$(ls -d /Users/corylin/Project/ai/ios-farm/.local/gads/recovered-wda/shamanec-WebDriverAgent-*/)
+   open -a Xcode "$WDA/WebDriverAgent.xcodeproj"
+   ```
+2. `Shift+Cmd+2` → Devices and Simulators → confirm the new device appears (briefly `Connecting`, then ready).
+3. Close that window. In the project window, change the active scheme (toolbar, next to destination) from the default to **`WebDriverAgentRunner`**.
+4. Change destination to the new device.
+5. `Cmd+B`. The first build registers the device on the developer portal and refreshes the wildcard provisioning profile.
+6. Wait for `Build Succeeded`, then quit Xcode.
+
+**10. Rebuild WDA Runner from CLI with the refreshed profile**
+
+```bash
+WDA=$(ls -d /Users/corylin/Project/ai/ios-farm/.local/gads/recovered-wda/shamanec-WebDriverAgent-*/)
+mkdir -p /tmp/wda-build
+cd "$WDA"
+xcodebuild build-for-testing \
+  -project WebDriverAgent.xcodeproj \
+  -scheme WebDriverAgentRunner \
+  -destination "id=<UDID>" \
+  -derivedDataPath /tmp/wda-build \
+  -allowProvisioningUpdates \
+  DEVELOPMENT_TEAM=<TEAM_ID> \
+  CODE_SIGN_STYLE=Automatic
+```
+
+Success line at the very end: `** TEST BUILD SUCCEEDED **`.
+
+If you see `No Account for Team "<id>"`, the team ID is wrong — re-read the OU field of the certificate, not the parenthesised dev ID.
+
+**11. Verify the rebuilt profile, package the IPA, replace and back up**
+
+```bash
+APP=/tmp/wda-build/Build/Products/Debug-iphoneos/WebDriverAgentRunner-Runner.app
+
+# Verify all expected devices are present and the profile is fresh
+python3 - <<'PYINNER'
+import plistlib, subprocess
+data = subprocess.check_output(["security","cms","-D","-i",
+  "/tmp/wda-build/Build/Products/Debug-iphoneos/WebDriverAgentRunner-Runner.app/embedded.mobileprovision"])
+p = plistlib.loads(data)
+print("Profile:", p.get("Name"))
+print("Expires:", p.get("ExpirationDate"))
+for d in p.get("ProvisionedDevices", []): print("  -", d)
+PYINNER
+
+# Repackage as IPA
+mkdir -p /tmp/wda-build/ipa-stage/Payload
+cp -R "$APP" /tmp/wda-build/ipa-stage/Payload/
+cd /tmp/wda-build/ipa-stage
+zip -qr /tmp/wda-build/WebDriverAgent.ipa Payload
+
+# Back up the current provider IPA and replace
+TS=$(date +%Y%m%d)
+IPA=/Users/corylin/Project/ai/ios-farm/.local/gads/provider-instance/WebDriverAgent.ipa
+cp "$IPA" "$IPA.bak-$TS"
+cp /tmp/wda-build/WebDriverAgent.ipa "$IPA"
+```
+
+**12. Re-enable the device**
+
+```bash
+docker exec gads-mongodb mongosh --quiet gads \
+  --eval "db.new_devices.updateOne({udid:'<UDID>'},{\$set:{usage:'enabled'}})"
+```
+
+The provider's next retry (within ~60 s) picks up the new IPA, installs it, mounts the Developer Disk Image, launches WDA over `testmanagerd`, then starts Appium.
+
+**13. Verify live**
+
+```bash
+# Wait up to 2 minutes, then:
+curl -s http://localhost:12000/device/<UDID>/info | python3 -m json.tool
+# expect: provider_state=live, connected=true, is_appium_up=true
+
+# In the browser: http://localhost:10001 → log in admin/password → device list shows new device →
+# open control page → confirm stream renders and a real tap responds.
+```
+
+Done.
+
+#### Troubleshooting
+
+1. **`No Account for Team "<id>"` on xcodebuild.** Wrong Team ID. Take the certificate `OU` field, not the parenthesised dev signing ID inside CN.
+2. **MongoDB commands fail with "No such container".** The container name is `gads-mongodb`, not `gads-mongo`.
+3. **`Please accept the PairingDialog on the device` looping after reboot.** Step 5 was skipped. Enabling Developer Mode triggers a reboot that wipes the lockdownd USB pair record. Run `ios pair --udid=<UDID>` again with the device unlocked.
+4. **Trust dialog never appears even though the device is unlocked.** The provider's retry loop is spamming pair requests and iOS has throttled the prompt. Disable the device (Step 8) for at least 15 seconds, then try `ios pair` manually.
+5. **`Did not find test app for 'com.codeyee.tempwda.xctrunner' on device. Is it installed?`.** The install step looked successful in logs but the IPA's provisioning profile does not include this device, so iOS silently refused the install. Diagnose with `ios apps --all --udid=<UDID> | grep -iE 'codeyee|wda|xctrunner'` — empty output confirms the silent failure. Fix by Steps 9-11.
+6. **`lost connection to testmanagerd. the test-runner may have been killed`.** Usually a transient first-launch validation by iOS. The next provider retry typically succeeds. If it persists for 3+ retries, re-check the profile expiration and provisioned devices.
+7. **No "Developer App" entry under `Settings → General → VPN & Device Management`.** Expected. On iOS 17+, Xcode automatic-signing certificates on a paired device are implicitly trusted; the manual cert-trust step required on iOS 16 and earlier no longer applies. If the entry is missing it is not a problem.
+8. **`go-ios agent is not running` warning on `ios` commands.** Cosmetic. As long as the userspace tunnel session is running and `curl http://localhost:28100/tunnels` returns the device, ignore the warning.
+
+#### WDA profile renewal
+
+Provisioning profiles issued by Apple Developer Portal expire after one year. When the profile is close to expiry or already expired, the same silent-install failure mode in Troubleshooting #5 will occur, even though no new device was added. Recovery is just Steps 9-11 — Steps 1-6 do not need to be repeated.
+
+To check the current profile's expiry without onboarding, run the verification block in Step 7.
 
 ### Android Phones
 
