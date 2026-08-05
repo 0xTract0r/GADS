@@ -10,6 +10,8 @@
 package router
 
 import (
+	"GADS/common/models"
+	"GADS/provider/config"
 	"GADS/provider/logger"
 	"bytes"
 	"context"
@@ -29,6 +31,27 @@ import (
 	"github.com/gobwas/ws"
 	"github.com/gobwas/ws/wsutil"
 )
+
+func IOSStreamMJPEGAuto(c *gin.Context) {
+	udid := c.Param("udid")
+	platDev, deviceFound := devices.DevManager.Get(udid)
+	if !deviceFound {
+		logger.ProviderLogger.LogError("IOSStreamMJPEGAuto", fmt.Sprintf("Device with UDID `%s` not found", udid))
+		c.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+
+	if iosDev, ok := platDev.(*devices.IOSDevice); ok && iosDev.GetDBDevice().StreamType == models.MJPEGStreamTypeId {
+		IOSStreamMJPEGWda(c)
+		return
+	}
+
+	if config.ProviderConfig.UseGadsIosStream {
+		IOSStreamMJPEG(c)
+		return
+	}
+	IOSStreamMJPEGWda(c)
+}
 
 func AndroidStreamProxy(c *gin.Context) {
 	udid := c.Param("udid")

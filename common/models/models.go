@@ -50,7 +50,7 @@ type DBDevice struct {
 	// This field will be removed in next major version release. Only kept for backward compatibility during migration.
 	UseWebRTCVideo bool          `json:"use_webrtc_video" bson:"use_webrtc_video"` // Should the device use WebRTC video instead of MJPEG
 	WorkspaceID    string        `json:"workspace_id" bson:"workspace_id"`         // ID of the associated workspace
-	StreamType StreamingType `json:"stream_type" bson:"stream_type"` // The type of video streaming for the device
+	StreamType     StreamingType `json:"stream_type" bson:"stream_type"`           // The type of video streaming for the device
 }
 
 // Device stream type - mjpeg, webrtc, etc
@@ -163,9 +163,10 @@ type IOSModelData struct {
 }
 
 type UpdateStreamSettings struct {
-	TargetFPS     int `json:"target_fps,omitempty"`
-	JpegQuality   int `json:"jpeg_quality,omitempty"`
-	ScalingFactor int `json:"scaling_factor,omitempty"`
+	TargetFPS     int           `json:"target_fps,omitempty"`
+	JpegQuality   int           `json:"jpeg_quality,omitempty"`
+	ScalingFactor int           `json:"scaling_factor,omitempty"`
+	StreamType    StreamingType `json:"stream_type,omitempty"`
 }
 
 type DBFile struct {

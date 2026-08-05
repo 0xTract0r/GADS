@@ -317,20 +317,23 @@ func DeviceInfo(c *gin.Context) {
 			}
 		}
 	case "ios":
+		resp.CurrentRotation = "portrait"
+		if platDev.GetProviderState() != "live" {
+			api.OK(c, "Successfully retrieved device info", resp)
+			return
+		}
+
 		wdaResp, err := wdaRequest(platDev, http.MethodGet, "orientation", nil)
 		if err != nil {
-			resp.CurrentRotation = "portrait"
-			api.OK(c, "", resp)
+			api.OK(c, "Successfully retrieved device info", resp)
 			return
 		}
 		defer wdaResp.Body.Close()
-
 		responseBody, _ := io.ReadAll(wdaResp.Body)
 		var responseJson WdaOrientationResponse
 		err = json.Unmarshal(responseBody, &responseJson)
 		if err != nil {
-			resp.CurrentRotation = "portrait"
-			api.OK(c, "", resp)
+			api.OK(c, "Successfully retrieved device info", resp)
 			return
 		}
 		resp.CurrentRotation = strings.ToLower(responseJson.Orientation)
@@ -604,6 +607,14 @@ func UpdateDeviceStreamSettings(c *gin.Context) {
 	common.MutexManager.StreamSettings.Lock()
 	defer common.MutexManager.StreamSettings.Unlock()
 
+	streamTypeChanged := streamSettings.StreamType != "" && streamSettings.StreamType != platDev.GetDBDevice().StreamType
+	if streamTypeChanged {
+		if !isSupportedStreamType(streamSettings.StreamType, platDev.GetOS(), rcDev.GetSupportedStreamTypes()) {
+			api.BadRequest(c, fmt.Sprintf("Stream type `%s` is not supported by `%s` device `%s`", streamSettings.StreamType, platDev.GetOS(), udid))
+			return
+		}
+		platDev.GetDBDevice().StreamType = streamSettings.StreamType
+	}
 	if streamSettings.TargetFPS != 0 && streamSettings.TargetFPS != rcDev.GetStreamTargetFPS() {
 		rcDev.SetStreamTargetFPS(streamSettings.TargetFPS)
 	}
@@ -619,6 +630,13 @@ func UpdateDeviceStreamSettings(c *gin.Context) {
 		return
 	}
 
+	if streamTypeChanged {
+		if err = db.GlobalMongoStore.AddOrUpdateDevice(platDev.GetDBDevice()); err != nil {
+			api.InternalError(c, "Failed to update device stream type in the DB")
+			return
+		}
+	}
+
 	deviceStreamSettings := models.DeviceStreamSettings{
 		UDID:                udid,
 		StreamTargetFPS:     rcDev.GetStreamTargetFPS(),
@@ -632,7 +650,23 @@ func UpdateDeviceStreamSettings(c *gin.Context) {
 		return
 	}
 
+	if streamTypeChanged {
+		platDev.Reset("Stream type changed, reprovisioning device")
+	}
+
 	api.OKMessage(c, "Stream settings updated")
+}
+
+func isSupportedStreamType(streamType models.StreamingType, os string, supportedTypes []models.StreamType) bool {
+	if len(supportedTypes) == 0 {
+		supportedTypes = models.StreamTypesForOS(os)
+	}
+	for _, supportedType := range supportedTypes {
+		if supportedType.ID == streamType {
+			return true
+		}
+	}
+	return false
 }
 
 func DeviceFiles(c *gin.Context) {

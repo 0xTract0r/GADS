@@ -29,6 +29,11 @@
 - *[iOS] Can the Broadcast Extension stream run all day?*
     - It can run for active remote-control sessions, but it is not the recommended unattended 24/7 default because ReplayKit screen capture plus H264 encoding can heat the device and later cause throttling, lag, or iOS stopping the broadcast.
     - For long idle periods, stop the broadcast or add an idle timeout. For long active sessions, lower fps/bitrate and keep the phone physically cool.
+- *[iOS] Can I switch between Broadcast and MJPEG from a web page?*
+    - Yes. The local Hub control page at `http://127.0.0.1:10001/devices/control/<UDID>` shows a small `iOS Stream Mode` overlay with `Broadcast Fast`, `MJPEG Fast`, `MJPEG Full`, and `Start Recording`.
+    - If the Hub overlay is unavailable, use the provider operator page at `http://127.0.0.1:12000/device/<UDID>/stream-mode`.
+    - A mode change persists the device config and may trigger reprovisioning.
+    - `Start Recording` does not silently start ReplayKit Broadcast. iOS still requires the Broadcast picker/system flow, so success must be verified by the `gads-broadcast-extension` process and a real browser frame.
 - *I can load the devices in UI but video is choppy/lags behind, is there something I can do?*
     - For Android, first try lowering target FPS or stream quality. For iOS, prefer `ios_webrtc_broadcast` for active remote-control sessions and keep `ios_webrtc_ffmpeg` / WDA MJPEG as a stability fallback.
     - If `ios_webrtc_broadcast` becomes choppy after a long run, stop the broadcast, cool the device, then restart with lower fps/bitrate.

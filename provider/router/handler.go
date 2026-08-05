@@ -63,6 +63,7 @@ func HandleRequests() *gin.Engine {
 	deviceGroup.POST("/screenshot", DeviceScreenshot)
 	deviceGroup.POST("/swipe", DeviceSwipe)
 	deviceGroup.POST("/custom-action", DeviceExecuteCustomAction)
+	deviceGroup.GET("/stream-mode", DeviceStreamModePage)
 	deviceGroup.GET("/appiumSource", DeviceAppiumSource)
 	deviceGroup.POST("/typeText", DeviceTypeText)
 	deviceGroup.GET("/getClipboard", DeviceGetClipboard)
@@ -73,11 +74,10 @@ func HandleRequests() *gin.Engine {
 	deviceGroup.POST("/update-stream-settings", UpdateDeviceStreamSettings)
 	if config.ProviderConfig.UseGadsIosStream {
 		deviceGroup.GET("/ios-stream", IosStreamProxyGADS)
-		deviceGroup.GET("/ios-stream-mjpeg", IOSStreamMJPEG)
 	} else {
 		deviceGroup.GET("/ios-stream", IosStreamProxyWDA)
-		deviceGroup.GET("/ios-stream-mjpeg", IOSStreamMJPEGWda)
 	}
+	deviceGroup.GET("/ios-stream-mjpeg", IOSStreamMJPEGAuto)
 	deviceGroup.GET("/ios-webrtc", IOSWebRTCSocket)
 	deviceGroup.GET("/android-webrtc", AndroidWebRTCSocket)
 	deviceGroup.GET("/ios-webrtc-broadcast", IOSBroadcastWebRTCSocket)
