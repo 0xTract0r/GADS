@@ -31,22 +31,24 @@ func injectHubControlTapFeedbackOverlay(indexBody []byte) []byte {
 
 const hubControlTapFeedbackOverlay = `<style id="gads-tap-feedback-overlay-style">
 @keyframes gads-tap-ripple-anim {
-  0%   { transform: translate(-50%, -50%) scale(0.4); opacity: 0.85; }
-  60%  { opacity: 0.55; }
-  100% { transform: translate(-50%, -50%) scale(1.8); opacity: 0; }
+  0%   { transform: translate(-50%, -50%) scale(0.82); opacity: 0.88; }
+  28%  { transform: translate(-50%, -50%) scale(1); opacity: 0.78; }
+  70%  { transform: translate(-50%, -50%) scale(1.03); opacity: 0.52; }
+  100% { transform: translate(-50%, -50%) scale(1.06); opacity: 0; }
 }
 .gads-tap-ripple {
   position: absolute;
-  width: 28px;
-  height: 28px;
+  width: 32px;
+  height: 32px;
   margin: 0;
   border-radius: 50%;
-  background: rgba(120, 200, 255, 0.65);
-  box-shadow: 0 0 12px rgba(120, 200, 255, 0.55);
+  background: rgba(56, 182, 255, 0.46);
+  border: 1px solid rgba(210, 242, 255, 0.72);
+  box-shadow: 0 0 10px rgba(56, 182, 255, 0.44);
   pointer-events: none;
   will-change: transform, opacity;
-  animation: gads-tap-ripple-anim 240ms ease-out forwards;
-  transform: translate(-50%, -50%) scale(0.4);
+  animation: gads-tap-ripple-anim 300ms cubic-bezier(0.2, 0, 0.2, 1) forwards;
+  transform: translate(-50%, -50%) scale(0.82);
 }
 .gads-tap-ripple-layer {
   position: absolute;
@@ -117,7 +119,7 @@ const hubControlTapFeedbackOverlay = `<style id="gads-tap-feedback-overlay-style
     };
     ripple.addEventListener("animationend", cleanup, { once: true });
     // Hard fallback in case animationend never fires (e.g. tab hidden).
-    setTimeout(cleanup, 600);
+    setTimeout(cleanup, 650);
   }
 
   function rippleFromEvent(layer, canvas, clientX, clientY) {

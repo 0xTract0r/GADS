@@ -16,6 +16,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"path"
 	"strings"
 
 	"github.com/gin-contrib/cors"
@@ -43,6 +44,15 @@ func HandleRequests(uiFiles fs.FS) *gin.Engine {
 		if err != nil {
 			log.Fatalf("Failed to get UI files filesystem: %v", err)
 		}
+		fileServer := http.FileServer(http.FS(uiFS))
+
+		serveUIFile := func(c *gin.Context, uiPath string) {
+			originalPath := c.Request.URL.Path
+			c.Request.URL.Path = "/" + strings.TrimPrefix(uiPath, "/")
+			fileServer.ServeHTTP(c.Writer, c.Request)
+			c.Request.URL.Path = originalPath
+			c.Abort()
+		}
 
 		r.Use(func(c *gin.Context) {
 			path := c.Request.URL.Path
@@ -55,11 +65,20 @@ func HandleRequests(uiFiles fs.FS) *gin.Engine {
 			if path != "/" {
 				_, err := uiFS.Open(strings.TrimPrefix(path, "/"))
 				if err != nil {
+					if imagePath, ok := normalizeUIImagePath(path); ok {
+						if _, imageErr := uiFS.Open(imagePath); imageErr == nil {
+							serveUIFile(c, imagePath)
+							return
+						}
+						if _, fallbackErr := uiFS.Open("images/no-gads.png"); fallbackErr == nil {
+							serveUIFile(c, "images/no-gads.png")
+							return
+						}
+					}
 					return
 				}
 			}
 
-			fileServer := http.FileServer(http.FS(uiFS))
 			fileServer.ServeHTTP(c.Writer, c.Request)
 			c.Abort()
 		})
@@ -78,7 +97,16 @@ func HandleRequests(uiFiles fs.FS) *gin.Engine {
 				return
 			}
 
-			http.ServeContent(c.Writer, c.Request, "index.html", stat.ModTime(), indexFile.(io.ReadSeeker))
+			indexBody, err := io.ReadAll(indexFile)
+			if err != nil {
+				c.AbortWithStatus(http.StatusInternalServerError)
+				return
+			}
+			indexBody = injectHubControlStreamModeOverlay(indexBody)
+			indexBody = injectHubControlTapFeedbackOverlay(indexBody)
+			indexBody = injectHubControlClipboardFreezeOverlay(indexBody)
+
+			http.ServeContent(c.Writer, c.Request, "index.html", stat.ModTime(), strings.NewReader(string(indexBody)))
 		})
 	}
 
@@ -161,4 +189,23 @@ func HandleRequests(uiFiles fs.FS) *gin.Engine {
 	appiumGroup.Any("/*path")
 
 	return r
+}
+
+func normalizeUIImagePath(requestPath string) (string, bool) {
+	cleanedPath := path.Clean("/" + strings.TrimPrefix(requestPath, "/"))
+	imagePrefix := "/images/"
+	if strings.HasPrefix(cleanedPath, imagePrefix) {
+		return strings.TrimPrefix(cleanedPath, "/"), true
+	}
+
+	imageIndex := strings.LastIndex(cleanedPath, imagePrefix)
+	if imageIndex == -1 {
+		return "", false
+	}
+
+	fileName := path.Base(cleanedPath)
+	if fileName == "." || fileName == "/" || fileName == "" {
+		return "", false
+	}
+	return "images/" + fileName, true
 }
