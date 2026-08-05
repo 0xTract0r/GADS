@@ -244,6 +244,16 @@ Developer mode needs to be enabled on iOS 16+ devices to allow `go-ios` usage ag
 - Open `Settings > Display & Brightness > Auto-Lock`
 - Set to **Never**
 
+#### Allow WebDriverAgent paste access - iOS 16+ only
+
+> **Required for reliable clipboard reads.** On iOS 16 and later, the system asks before one app reads pasteboard content copied from another app. GADS reads the iOS clipboard through `WebDriverAgentRunner-Runner`, so new real iOS devices should allow WDA paste access once during onboarding.
+
+- Install and launch WebDriverAgent on the device, or trigger one GADS clipboard read so iOS creates the app privacy entry.
+- Open `Settings > Apps > WebDriverAgentRunner-Runner > Paste from Other Apps`.
+- Set it to **Allow**.
+
+This setting is normally kept when the same device reconnects or when the same WDA app is updated in place with the same bundle identifier. Recheck it after uninstalling/reinstalling WDA, changing the WDA bundle identifier, erasing/resetting the device, or if `Failed to get device clipboard!` appears with an `Allow Paste` prompt. If the `Paste from Other Apps` menu is missing, launch WDA or trigger one clipboard read first so iOS creates the per-app setting.
+
 #### Supervise devices
 
 This is an optional but a preferable step - it can make devices setup more autonomous - it can allow trusted pairing with devices without interacting with Trust popup  

@@ -11,6 +11,8 @@
 - `ios_webrtc_broadcast` 是当前低延迟交互首选；`ios_webrtc_ffmpeg` / WDA MJPEG 是稳定兜底。
 - 不要把 ReplayKit Broadcast Extension、设备端 `8765` 或 WDA MJPEG `9100` 的视频流问题等同于整机离线；先判断 WDA `8100`、Appium、设备枚举是否仍健康。
 - `Waiting for video frames` 不能只看 WebRTC track；真实通过优先看 `requestVideoFrameCallback` 或非黑屏像素，最低也要检查浏览器 `<video>` 达到 `readyState >= 2` 且 `videoWidth/videoHeight > 0`。
+- 不能只凭 provider `live`、WDA/Appium up、设备进程存在或 WebRTC track 到达就说“连好了”；必须有 `13001` viewer 或 `10001` Hub 控制页的真实非黑屏证据。
+- iOS 剪贴板不能只凭 HTTP 200 或 `Device clipboard copied!` toast 判定成功；必须确认 provider 响应 `result` 是预期非空文本，并且 Hub 点击后浏览器 `navigator.clipboard.readText()` 读到同一文本。
 - iOS 控制链优先复用健康 Appium session；发现 stale session 后要清理本地状态，再 fallback 到 control session 或 WDA session endpoint。
 - iOS 设备枚举有抖动，不能因为一次 `ios.ListDevices()` miss 立刻 reset 整机。
 

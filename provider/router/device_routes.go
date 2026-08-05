@@ -16,6 +16,7 @@ import (
 	"io"
 	"net/http"
 	"time"
+	"unicode/utf8"
 
 	"GADS/common/api"
 	"GADS/common/models"
@@ -130,20 +131,62 @@ func DeviceGetClipboard(c *gin.Context) {
 		return
 	}
 
-	// Unmarshal the response body to get the actual value returned
-	valueResp := struct {
-		Value string `json:"value"`
-	}{}
-	err = json.Unmarshal(clipboardResponseBody, &valueResp)
+	clipboardText, err := decodeClipboardResponse(clipboardResponseBody)
 	if err != nil {
-		platDev.GetLogger().LogError("appium_interact", fmt.Sprintf("Failed to unmarshal clipboard response body - %s", err))
-		api.InternalError(c, fmt.Sprintf("Failed to unmarshal clipboard response body - %s", err))
+		platDev.GetLogger().LogError("appium_interact", fmt.Sprintf("Failed to decode clipboard response body - %s", err))
+		api.InternalError(c, fmt.Sprintf("Failed to decode clipboard response body - %s", err))
 		return
 	}
 
-	// Decode the value because Appium returns it as base64 encoded string
-	decoded, _ := base64.StdEncoding.DecodeString(valueResp.Value)
-	api.OKMessage(c, string(decoded))
+	api.OK(c, clipboardText, clipboardText)
+}
+
+func decodeClipboardResponse(body []byte) (string, error) {
+	valueResp := struct {
+		Value string `json:"value"`
+	}{}
+	if err := json.Unmarshal(body, &valueResp); err != nil {
+		return "", err
+	}
+	if valueResp.Value == "" {
+		return "", nil
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(valueResp.Value)
+	if err != nil || !utf8.Valid(decoded) {
+		return valueResp.Value, nil
+	}
+	return string(decoded), nil
+}
+
+func successfulClipboardResponse(resp *http.Response, requireNonEmpty bool) (*http.Response, error) {
+	if resp == nil {
+		return nil, fmt.Errorf("clipboard response is empty")
+	}
+	if resp.Body == nil {
+		return resp, fmt.Errorf("clipboard response body is empty")
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		resp.Body.Close()
+		return nil, err
+	}
+	resp.Body.Close()
+	restoredResp := restoreResponseBody(resp, body)
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		return restoredResp, fmt.Errorf("clipboard response failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	clipboardText, err := decodeClipboardResponse(body)
+	if err != nil {
+		return restoredResp, err
+	}
+	if requireNonEmpty && clipboardText == "" {
+		return restoredResp, fmt.Errorf("clipboard response value is empty")
+	}
+	return restoredResp, nil
 }
 
 // Call respective Appium/WDA endpoint to lock the device

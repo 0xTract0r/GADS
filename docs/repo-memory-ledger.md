@@ -2,6 +2,22 @@
 
 This ledger stores stable, reusable decisions and evidence. Session-only progress stays in `.ai/todos.md`.
 
+## 2026-07-07: iOS clipboard permission fallback without blind taps
+
+Decision: keep the direct WDA pasteboard fast path, but when iOS requires foreground WDA access, mask the temporary foreground transition in the Hub and never guess the location of an `Allow Paste` button.
+
+Why:
+
+- On iOS 16+, `wda/getPasteboard` can return an empty value or trigger a system paste-permission prompt.
+- WDA can report `no such alert` for the same prompt it triggered. Blind coordinate taps then hit unrelated Safari UI when the prompt is absent or disappears.
+- Temporarily foregrounding WDA is still the only reliable fallback observed on these devices, so the Hub preserves the last video frame while the request is in flight and the provider restores the previous foreground app asynchronously.
+
+Verification evidence:
+
+- Provider and Hub clipboard checks on SE02 returned real clipboard content after the final no-blind-tap change.
+- The Hub control stream stayed non-black throughout the clipboard request, and the provider remained `live`.
+- Provider router tests and `git diff --check` passed. XR-specific verification of this final revision remains a known gap.
+
 ## 2026-05-19: iOS new-device onboarding runbook
 
 ### Decisions

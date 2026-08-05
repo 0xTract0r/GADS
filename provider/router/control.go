@@ -9,14 +9,18 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/danielpaulus/go-ios/ios/instruments"
@@ -33,6 +37,11 @@ const (
 	iosControlDragVelocity      = 2500
 	iosControlDragPressDuration = 0.03
 	iosControlDragHoldDuration  = 0.02
+	iosClipboardDirectTimeout   = 2 * time.Second
+	iosClipboardFallbackTimeout = 6 * time.Second
+	iosPasteAlertPollInterval   = 250 * time.Millisecond
+	iosPasteAlertRequestTimeout = 1 * time.Second
+	iosPasteAlertAcceptTimeout  = 5 * time.Second
 )
 
 func androidRemoteServerRequest(dev devices.PlatformDevice, method, endpoint string, requestBody io.Reader) (*http.Response, error) {
@@ -111,9 +120,16 @@ func appiumExecuteScriptForSession(dev devices.PlatformDevice, sessionID, script
 }
 
 func wdaRequest(dev devices.PlatformDevice, method, endpoint string, requestBody io.Reader) (*http.Response, error) {
+	return wdaRequestWithClient(controlNetClient, dev, method, endpoint, requestBody)
+}
+
+func wdaRequestWithClient(client *http.Client, dev devices.PlatformDevice, method, endpoint string, requestBody io.Reader) (*http.Response, error) {
 	iosDev, ok := dev.(*devices.IOSDevice)
 	if !ok {
 		return nil, fmt.Errorf("device %s is not an iOS device", dev.GetUDID())
+	}
+	if client == nil {
+		client = controlNetClient
 	}
 	url := fmt.Sprintf("http://localhost:%v/%s", iosDev.GetWDAPort(), endpoint)
 	dev.GetLogger().LogDebug("wda_interact", fmt.Sprintf("Calling `%s` for device `%s`", url, dev.GetUDID()))
@@ -121,11 +137,18 @@ func wdaRequest(dev devices.PlatformDevice, method, endpoint string, requestBody
 	if err != nil {
 		return nil, err
 	}
-	return controlNetClient.Do(req)
+	if requestBody != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	return client.Do(req)
 }
 
 func wdaSessionRequest(dev devices.PlatformDevice, method, sessionID, endpoint string, requestBody io.Reader) (*http.Response, error) {
-	return wdaRequest(dev, method, fmt.Sprintf("session/%s/%s", sessionID, endpoint), requestBody)
+	return wdaSessionRequestWithClient(controlNetClient, dev, method, sessionID, endpoint, requestBody)
+}
+
+func wdaSessionRequestWithClient(client *http.Client, dev devices.PlatformDevice, method, sessionID, endpoint string, requestBody io.Reader) (*http.Response, error) {
+	return wdaRequestWithClient(client, dev, method, fmt.Sprintf("session/%s/%s", sessionID, endpoint), requestBody)
 }
 
 func restoreResponseBody(resp *http.Response, body []byte) *http.Response {
@@ -191,12 +214,16 @@ func refreshWDASessionID(dev devices.PlatformDevice) (string, error) {
 }
 
 func wdaSessionRequestWithRetry(dev devices.PlatformDevice, method, endpoint string, requestBody []byte) (*http.Response, error) {
+	return wdaSessionRequestWithRetryUsingClient(controlNetClient, dev, method, endpoint, requestBody)
+}
+
+func wdaSessionRequestWithRetryUsingClient(client *http.Client, dev devices.PlatformDevice, method, endpoint string, requestBody []byte) (*http.Response, error) {
 	sessionID, err := getOrCreateWDASessionID(dev)
 	if err != nil {
 		return nil, err
 	}
 
-	resp, err := wdaSessionRequest(dev, method, sessionID, endpoint, bytes.NewReader(requestBody))
+	resp, err := wdaSessionRequestWithClient(client, dev, method, sessionID, endpoint, bytes.NewReader(requestBody))
 	if err != nil {
 		return nil, err
 	}
@@ -217,11 +244,15 @@ func wdaSessionRequestWithRetry(dev devices.PlatformDevice, method, endpoint str
 		return nil, err
 	}
 
-	return wdaSessionRequest(dev, method, refreshedSessionID, endpoint, bytes.NewReader(requestBody))
+	return wdaSessionRequestWithClient(client, dev, method, refreshedSessionID, endpoint, bytes.NewReader(requestBody))
 }
 
 func wdaRequestWithSessionFallback(dev devices.PlatformDevice, method, endpoint string, requestBody []byte, sessionEndpoint string, sessionRequestBody []byte) (*http.Response, error) {
-	resp, err := wdaRequest(dev, method, endpoint, bytes.NewReader(requestBody))
+	return wdaRequestWithSessionFallbackUsingClient(controlNetClient, dev, method, endpoint, requestBody, sessionEndpoint, sessionRequestBody)
+}
+
+func wdaRequestWithSessionFallbackUsingClient(client *http.Client, dev devices.PlatformDevice, method, endpoint string, requestBody []byte, sessionEndpoint string, sessionRequestBody []byte) (*http.Response, error) {
+	resp, err := wdaRequestWithClient(client, dev, method, endpoint, bytes.NewReader(requestBody))
 	if err != nil {
 		return nil, err
 	}
@@ -237,7 +268,7 @@ func wdaRequestWithSessionFallback(dev devices.PlatformDevice, method, endpoint 
 		return restoreResponseBody(resp, body), nil
 	}
 
-	return wdaSessionRequestWithRetry(dev, method, sessionEndpoint, sessionRequestBody)
+	return wdaSessionRequestWithRetryUsingClient(client, dev, method, sessionEndpoint, sessionRequestBody)
 }
 
 func inferDirectionalSwipe(x, y, endX, endY float64) (string, bool) {
@@ -916,6 +947,10 @@ func deviceRecents(dev devices.PlatformDevice) error {
 }
 
 func activateApp(dev devices.PlatformDevice, appIdentifier string) (*http.Response, error) {
+	return activateAppWithClient(controlNetClient, dev, appIdentifier)
+}
+
+func activateAppWithClient(client *http.Client, dev devices.PlatformDevice, appIdentifier string) (*http.Response, error) {
 	if dev.GetOS() == "ios" {
 		requestBody := struct {
 			BundleId string `json:"bundleId"`
@@ -928,7 +963,7 @@ func activateApp(dev devices.PlatformDevice, appIdentifier string) (*http.Respon
 			return nil, fmt.Errorf("appiumActivateApp: Failed to marshal request body json when activating app for device `%s` - %s", dev.GetUDID(), err)
 		}
 
-		activateAppResp, err := wdaRequestWithSessionFallback(dev, http.MethodPost, "wda/apps/activate", reqJson, "wda/apps/activate", reqJson)
+		activateAppResp, err := wdaRequestWithSessionFallbackUsingClient(client, dev, http.MethodPost, "wda/apps/activate", reqJson, "wda/apps/activate", reqJson)
 		if err != nil {
 			return activateAppResp, err
 		}
@@ -939,6 +974,349 @@ func activateApp(dev devices.PlatformDevice, appIdentifier string) (*http.Respon
 	}
 
 	return nil, fmt.Errorf("App activation available only for iOS devices")
+}
+
+func wdaClipboardRequestWithClient(client *http.Client, dev devices.PlatformDevice, requestBody []byte) (*http.Response, error) {
+	return wdaRequestWithSessionFallbackUsingClient(client, dev, http.MethodPost, "wda/getPasteboard", requestBody, "wda/getPasteboard", requestBody)
+}
+
+func wdaClipboardRequestAllowingPasteAlert(client *http.Client, dev devices.PlatformDevice, requestBody []byte) (*http.Response, error) {
+	stopWatcher := startIOSPasteAlertWatcher(dev)
+	resp, err := wdaClipboardRequestWithClient(client, dev, requestBody)
+	if stopWatcher() {
+		dev.GetLogger().LogDebug("wda_interact", fmt.Sprintf("Accepted iOS paste permission alert while reading clipboard for device `%s`", dev.GetUDID()))
+	}
+	return resp, err
+}
+
+func marshalWDAAlertName(name string) ([]byte, error) {
+	if name == "" {
+		return nil, nil
+	}
+	payload := struct {
+		Name string `json:"name"`
+	}{
+		Name: name,
+	}
+	return json.MarshalIndent(payload, "", "  ")
+}
+
+func wdaAlertCommandWithClient(client *http.Client, dev devices.PlatformDevice, endpoint string, name string) error {
+	requestBody, err := marshalWDAAlertName(name)
+	if err != nil {
+		return err
+	}
+	action := fmt.Sprintf("calling WDA %s", endpoint)
+	if name != "" {
+		action = fmt.Sprintf("calling WDA %s for button `%s`", endpoint, name)
+	}
+
+	var lastErr error
+	resp, err := wdaRequestWithClient(client, dev, http.MethodPost, endpoint, bytes.NewReader(requestBody))
+	if err == nil {
+		if ensureErr := ensureSuccessfulResponse(resp, action); ensureErr == nil {
+			resp.Body.Close()
+			return nil
+		} else {
+			lastErr = ensureErr
+		}
+	} else {
+		lastErr = err
+	}
+
+	resp, err = wdaSessionRequestWithRetryUsingClient(client, dev, http.MethodPost, endpoint, requestBody)
+	if err != nil {
+		if lastErr != nil {
+			return fmt.Errorf("%v; session fallback failed: %w", lastErr, err)
+		}
+		return err
+	}
+	if ensureErr := ensureSuccessfulResponse(resp, action); ensureErr != nil {
+		if lastErr != nil {
+			return fmt.Errorf("%v; session fallback failed: %w", lastErr, ensureErr)
+		}
+		return ensureErr
+	}
+	resp.Body.Close()
+	return nil
+}
+
+func acceptWDAAlertWithClient(client *http.Client, dev devices.PlatformDevice, name string) error {
+	return wdaAlertCommandWithClient(client, dev, "alert/accept", name)
+}
+
+func wdaAlertTextWithClient(client *http.Client, dev devices.PlatformDevice) (string, error) {
+	var lastErr error
+	for _, useSession := range []bool{false, true} {
+		var resp *http.Response
+		var err error
+		if useSession {
+			resp, err = wdaSessionRequestWithRetryUsingClient(client, dev, http.MethodGet, "alert/text", nil)
+		} else {
+			resp, err = wdaRequestWithClient(client, dev, http.MethodGet, "alert/text", nil)
+		}
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		text, err := readWDAStringValue(resp, "getting alert text")
+		if err == nil {
+			return text, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("getting alert text failed")
+	}
+	return "", lastErr
+}
+
+func readWDAStringValue(resp *http.Response, action string) (string, error) {
+	if resp == nil {
+		return "", fmt.Errorf("%s failed: empty response", action)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode >= http.StatusBadRequest {
+		return "", fmt.Errorf("%s failed with status %d: %s", action, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var valueResp struct {
+		Value json.RawMessage `json:"value"`
+	}
+	if err := json.Unmarshal(body, &valueResp); err != nil {
+		return "", err
+	}
+	var value string
+	if err := json.Unmarshal(valueResp.Value, &value); err != nil {
+		return "", fmt.Errorf("%s returned non-string value: %w", action, err)
+	}
+	return strings.TrimSpace(value), nil
+}
+
+func isNoSuchAlertError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "no such alert") ||
+		strings.Contains(message, "modal dialog when one was not open")
+}
+
+func iosPasteAlertAllowButtonLabels() []string {
+	return []string{"Allow Paste", "Paste", "Allow", "允许粘贴", "允许复制", "允许", "允許貼上", "貼上", "允許"}
+}
+
+func acceptIOSPasteAlertWithClient(client *http.Client, dev devices.PlatformDevice) error {
+	alertText, textErr := wdaAlertTextWithClient(client, dev)
+	if textErr == nil {
+		if !isPastePermissionAlertMessage(alertText) {
+			return fmt.Errorf("active alert is not an iOS paste permission alert: %q", alertText)
+		}
+	} else if isNoSuchAlertError(textErr) {
+		return textErr
+	}
+
+	var lastErr error
+	if textErr != nil {
+		lastErr = textErr
+	}
+	for _, label := range iosPasteAlertAllowButtonLabels() {
+		if err := acceptWDAAlertWithClient(client, dev, label); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+	}
+	if isNoSuchAlertError(textErr) {
+		return lastErr
+	}
+	if err := acceptWDAAlertWithClient(client, dev, ""); err == nil {
+		return nil
+	} else {
+		lastErr = err
+	}
+	return lastErr
+}
+
+func waitForIOSPasteAlertAcceptance(client *http.Client, dev devices.PlatformDevice, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		if err := acceptIOSPasteAlertWithClient(client, dev); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		if timeout <= 0 || time.Now().Add(iosPasteAlertPollInterval).After(deadline) {
+			break
+		}
+		time.Sleep(iosPasteAlertPollInterval)
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("iOS paste permission alert was not accepted before timeout")
+	}
+	return lastErr
+}
+
+func waitForIOSPasteAlertBestEffort(client *http.Client, dev devices.PlatformDevice, timeout time.Duration) {
+	if err := waitForIOSPasteAlertAcceptance(client, dev, timeout); err != nil {
+		dev.GetLogger().LogDebug("wda_interact", fmt.Sprintf("No iOS paste permission alert accepted for device `%s`: %v", dev.GetUDID(), err))
+	}
+}
+
+func startIOSPasteAlertWatcher(dev devices.PlatformDevice) func() bool {
+	ctx, cancel := context.WithCancel(context.Background())
+	accepted := make(chan struct{}, 1)
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		client := &http.Client{Timeout: iosPasteAlertRequestTimeout}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			if err := acceptIOSPasteAlertWithClient(client, dev); err == nil {
+				select {
+				case accepted <- struct{}{}:
+				default:
+				}
+				return
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(iosPasteAlertPollInterval):
+			}
+		}
+	}()
+
+	return func() bool {
+		cancel()
+		select {
+		case <-done:
+		default:
+		}
+		select {
+		case <-accepted:
+			return true
+		default:
+			return false
+		}
+	}
+}
+
+func acceptIOSPasteAlertBestEffort(client *http.Client, dev devices.PlatformDevice) {
+	if err := acceptIOSPasteAlertWithClient(client, dev); err != nil {
+		dev.GetLogger().LogDebug("wda_interact", fmt.Sprintf("No iOS paste permission alert accepted for device `%s`: %v", dev.GetUDID(), err))
+	}
+}
+
+func iosActiveBundleIDWithClient(client *http.Client, dev devices.PlatformDevice) (string, error) {
+	resp, err := wdaRequestWithClient(client, dev, http.MethodGet, "wda/activeAppInfo", nil)
+	if err != nil {
+		return "", err
+	}
+	if resp == nil {
+		return "", fmt.Errorf("active app response is empty")
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode >= http.StatusBadRequest {
+		return "", fmt.Errorf("active app request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var activeApp struct {
+		Value struct {
+			BundleID string `json:"bundleId"`
+		} `json:"value"`
+	}
+	if err := json.Unmarshal(body, &activeApp); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(activeApp.Value.BundleID), nil
+}
+
+func shouldRestoreIOSForegroundBundle(bundleID string) bool {
+	bundleID = strings.TrimSpace(bundleID)
+	if bundleID == "" {
+		return false
+	}
+	if strings.EqualFold(bundleID, config.ProviderConfig.WdaBundleID) {
+		return false
+	}
+	return !strings.Contains(strings.ToLower(bundleID), "xctrunner") &&
+		!strings.Contains(strings.ToLower(bundleID), "webdriveragent")
+}
+
+func restoreIOSForegroundAsync(dev devices.PlatformDevice, bundleID string) {
+	bundleID = strings.TrimSpace(bundleID)
+	if bundleID == "" {
+		return
+	}
+
+	go func() {
+		restoreClient := &http.Client{Timeout: 3 * time.Second}
+		resp, err := activateAppWithClient(restoreClient, dev, bundleID)
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
+		if err != nil {
+			dev.GetLogger().LogWarn("wda_interact", fmt.Sprintf("Failed to restore foreground app `%s` after iOS clipboard fallback for device `%s`: %v", bundleID, dev.GetUDID(), err))
+		}
+	}()
+}
+
+func isPastePermissionAlertMessage(message string) bool {
+	message = strings.ToLower(message)
+	return strings.Contains(message, "would like to paste") ||
+		strings.Contains(message, "allow paste") ||
+		strings.Contains(message, "paste from") ||
+		strings.Contains(message, "允许粘贴") ||
+		strings.Contains(message, "允许复制") ||
+		strings.Contains(message, "想从") && strings.Contains(message, "粘贴") ||
+		strings.Contains(message, "允許貼上") ||
+		strings.Contains(message, "想從") && strings.Contains(message, "貼上")
+}
+
+func isWDAStallError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isPastePermissionAlertMessage(err.Error()) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, os.ErrDeadlineExceeded) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "context deadline exceeded") ||
+		strings.Contains(message, "client.timeout") ||
+		strings.Contains(message, "timeout awaiting response headers") ||
+		strings.Contains(message, "connection refused") ||
+		strings.Contains(message, "connection reset") ||
+		strings.Contains(message, "eof")
 }
 
 func deviceGetClipboard(dev devices.PlatformDevice) (*http.Response, error) {
@@ -953,23 +1331,81 @@ func deviceGetClipboard(dev devices.PlatformDevice) (*http.Response, error) {
 			return nil, fmt.Errorf("appiumGetClipboard: Failed to marshal request body json when getting clipboard for device `%s` - %s", dev.GetUDID(), err)
 		}
 
-		activateAppResp, err := activateApp(dev, config.ProviderConfig.WdaBundleID)
-		if err != nil {
-			return activateAppResp, fmt.Errorf("appiumGetClipboard: Failed to activate app - %s", err)
+		directClient := &http.Client{Timeout: iosClipboardDirectTimeout}
+		clipboardResp, err := wdaClipboardRequestAllowingPasteAlert(directClient, dev, reqJson)
+		if err == nil {
+			checkedResp, checkErr := successfulClipboardResponse(clipboardResp, true)
+			if checkErr == nil {
+				return checkedResp, nil
+			}
+			if checkedResp != nil {
+				checkedResp.Body.Close()
+			}
+			err = checkErr
 		}
-		defer activateAppResp.Body.Close()
-
-		clipboardResp, err := wdaRequest(dev, http.MethodPost, "wda/getPasteboard", bytes.NewReader(reqJson))
 		if err != nil {
-			return clipboardResp, fmt.Errorf("appiumGetClipboard: Failed to execute Appium request for device `%s` - %s", dev.GetUDID(), err)
+			if isWDAStallError(err) {
+				dev.GetLogger().LogWarn("wda_interact", fmt.Sprintf("Direct iOS clipboard read hit WDA/client stall for device `%s`, retrying with foreground WDA Runner fallback: %v", dev.GetUDID(), err))
+			} else {
+				dev.GetLogger().LogWarn("wda_interact", fmt.Sprintf("Direct iOS clipboard read missed for device `%s`, retrying with foreground WDA Runner fallback: %v", dev.GetUDID(), err))
+			}
 		}
 
-		_, err = deviceHome(dev)
-		if err != nil {
-			dev.GetLogger().LogWarn("appium_interact", "appiumGetClipboard: Failed to navigate to Home/Springboard using Appium")
+		fallbackClient := &http.Client{Timeout: iosClipboardFallbackTimeout}
+		restoreBundleID := ""
+		if activeBundleID, activeErr := iosActiveBundleIDWithClient(directClient, dev); activeErr == nil {
+			if shouldRestoreIOSForegroundBundle(activeBundleID) {
+				restoreBundleID = activeBundleID
+			}
+		} else {
+			dev.GetLogger().LogDebug("wda_interact", fmt.Sprintf("Failed to record foreground app before iOS clipboard fallback for device `%s`: %v", dev.GetUDID(), activeErr))
 		}
 
-		return clipboardResp, nil
+		activateAppResp, err := activateAppWithClient(fallbackClient, dev, config.ProviderConfig.WdaBundleID)
+		if activateAppResp != nil && activateAppResp.Body != nil {
+			activateAppResp.Body.Close()
+		}
+		if err != nil {
+			if restoreBundleID != "" {
+				restoreIOSForegroundAsync(dev, restoreBundleID)
+			}
+			return activateAppResp, fmt.Errorf("appiumGetClipboard: Failed to activate WDA Runner for device `%s` clipboard fallback - %s", dev.GetUDID(), err)
+		}
+		if restoreBundleID != "" {
+			defer restoreIOSForegroundAsync(dev, restoreBundleID)
+		}
+
+		clipboardResp, err = wdaClipboardRequestAllowingPasteAlert(fallbackClient, dev, reqJson)
+		if err != nil {
+			waitForIOSPasteAlertBestEffort(fallbackClient, dev, iosPasteAlertAcceptTimeout)
+			time.Sleep(300 * time.Millisecond)
+			clipboardResp, err = wdaClipboardRequestAllowingPasteAlert(fallbackClient, dev, reqJson)
+			if err != nil {
+				return clipboardResp, fmt.Errorf("appiumGetClipboard: Failed to execute WDA pasteboard request for device `%s` after foregrounding WDA Runner - %s", dev.GetUDID(), err)
+			}
+		}
+
+		checkedResp, checkErr := successfulClipboardResponse(clipboardResp, true)
+		if checkErr != nil {
+			if checkedResp != nil {
+				checkedResp.Body.Close()
+			}
+			waitForIOSPasteAlertBestEffort(fallbackClient, dev, iosPasteAlertAcceptTimeout)
+			time.Sleep(300 * time.Millisecond)
+			clipboardResp, err = wdaClipboardRequestAllowingPasteAlert(fallbackClient, dev, reqJson)
+			if err != nil {
+				return clipboardResp, fmt.Errorf("appiumGetClipboard: Failed to execute WDA pasteboard request for device `%s` after foreground paste alert fallback - %s", dev.GetUDID(), err)
+			}
+			checkedResp, checkErr = successfulClipboardResponse(clipboardResp, true)
+			if checkErr != nil {
+				if checkedResp != nil {
+					checkedResp.Body.Close()
+				}
+				return checkedResp, fmt.Errorf("appiumGetClipboard: Failed to get non-empty clipboard value for device `%s` after foregrounding WDA Runner - %s", dev.GetUDID(), checkErr)
+			}
+		}
+
+		return checkedResp, nil
 	} else {
 		return androidRemoteServerRequest(dev, http.MethodPost, "clipboard", nil)
 	}
