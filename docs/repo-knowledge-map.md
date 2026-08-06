@@ -23,9 +23,9 @@ Last updated: 2026-08-06
 
 ## iOS Remote-Control Map
 
-- Device setup and WDA/Appium lifecycle: `provider/devices/ios.go`, `provider/devices/appium.go`, `provider/devices/common.go`.
+- Device setup, installed-app inventory, and WDA/Appium lifecycle: `provider/devices/ios.go`, `provider/devices/appium.go`, `provider/devices/common.go`.
 - Runtime state and provider info fields: `provider/devices/runtime.go`, `provider/devices/platform.go`, `provider/router/routes.go`.
-- Tap/swipe/type/clipboard routing: `provider/router/control.go`, `provider/router/appium.go`, `provider/router/device_routes.go`.
+- Tap/swipe/type/clipboard routing: `provider/router/control.go`, `provider/router/appium.go`, `provider/router/device_routes.go`; per-device typing batching and latency logs: `provider/router/typing_coalescer.go`.
 - WDA MJPEG to WebRTC fallback: `provider/router/ios_stream_webrtc.go`.
 - Plain WDA MJPEG HTTP and WebSocket proxies: `provider/router/stream.go`. Both must preserve the fixed-buffer, downstream-cancellable, frame-size-bounded invariant documented in `docs/repo-memory-ledger.md` under the 2026-08-06 entry.
 - ReplayKit Broadcast H264 to WebRTC path: `provider/router/ios_stream_webrtc_broadcast.go`.
@@ -42,11 +42,13 @@ Last updated: 2026-08-06
 ## iOS Tap Latency and Typing Performance (2026-05-15)
 
 - Measured baselines, 400 ms physical floor breakdown, WDA-first decision, and typing coalescer rationale: `docs/repo-memory-ledger.md` § "2026-05-15: iOS tap and typing latency optimization".
+- Corrected idle/hard-deadline semantics, live typing evidence, and the bounded installed-app invariant: `docs/repo-memory-ledger.md` § "2026-08-06: Correct iOS typing deadlines and bound installed-app browsing".
 - iOS 17+ tunnel requirement (`gads-ios-tunnel`) is documented in the same ledger entry.
 
 ## Verification Baselines
 
 - Provider package tests: `go test -vet=off ./provider/...`.
+- Typing/app-inventory changes also require focused race tests, exact XR text verification through the Hub product path, a real non-black control-page frame, repeated `/apps` calls, and before/after RSS plus heap evidence.
 - WDA MJPEG changes also require focused normal/oversize/stall/cancel/WebSocket tests, a static check that no `io.ReadAll(part)` remains in `provider/router/stream.go`, and a reconnect-heavy RSS check.
 - Strict iOS first-frame check must assert browser `<video>` readiness and dimensions, not just WebRTC track arrival.
 - Latest restored strict Broadcast viewer evidence: `/tmp/gads-verify-13001.js` run on 2026-05-10 against `http://127.0.0.1:13001`, with `requestVideoFrameCallback` first frame, `readyState=4`, `828x1792`, and first frame around `619ms`.
@@ -65,4 +67,5 @@ Last updated: 2026-08-06
 - Clipboard verification must check actual content: provider `result` must match expected non-empty text and Hub browser clipboard must read the same value. Toast `Device clipboard copied!` alone is not evidence.
 - Keep long-running provider processes in local `tmux`; record the session name, binary path, and log path in `.ai/todos.md`.
 - On iOS 17+, start and verify `tmux:gads-ios-tunnel` before restarting Provider. A provider that repeatedly times out starting WDA after a cold restart is not valid MJPEG performance evidence.
+- If WDA installation loops after previously working, inspect the active IPA's embedded profile and device syslog for `0xe8008018`; an asynchronous install log alone does not prove iOS accepted the bundle.
 - Before committing, ensure any Apple signing team IDs, provisioning profiles, DerivedData, or personal bundle IDs are not hardcoded unless deliberately documented as local examples.

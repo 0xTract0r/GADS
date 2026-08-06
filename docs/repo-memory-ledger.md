@@ -2,6 +2,33 @@
 
 This ledger stores stable, reusable decisions and evidence. Session-only progress stays in `.ai/todos.md`.
 
+## 2026-08-06: Correct iOS typing deadlines and bound installed-app browsing
+
+Decision: keep Provider-side fire-and-forget typing, but recompute the 90 ms idle deadline from the newest pending character while preserving the 350 ms hard deadline from the oldest character. Flush immediately at 64 characters. The iOS installed-app path must use a bounded, serialized installation-proxy reader rather than go-ios `BrowseAllApps` / `BrowseUserApps`.
+
+Why:
+
+- The original typing flusher started one idle timer from the first character. Later characters did not extend it, so normal input fragmented into avoidable WDA `/wda/keys` calls and visibly trailed the browser.
+- The Hub control page automatically loads `/apps`. Two concurrent unbounded go-ios browse calls retained about 5.8 GiB of Provider heap, raised physical footprint above 10 GiB, and reset the XR lifecycle.
+- installation-proxy metadata such as `CurrentAmount` is device input and must not control an allocation.
+
+Implementation memory:
+
+- `provider/router/typing_coalescer.go` stores an arrival timestamp per rune, wakes the flusher on every submission, derives idle and hard deadlines from the actual queue, and preserves timestamps for input that arrives during an in-flight WDA call.
+- Successful WDA batches log `batch_size`, `queue_ms`, `wda_ms`, `total_ms`, `pending`, and HTTP status. HTTP ACK remains immediate; downstream WDA failures remain best-effort logs.
+- `provider/devices/ios.go` limits each installation-proxy plist payload to 64 MiB before allocation, stops after 32 pages or 10,000 apps, ignores `CurrentAmount` for capacity, and serializes app browsing per device. Provider call sites no longer use the unbounded go-ios browse helpers.
+
+Verification evidence:
+
+- Focused coalescer/device tests, race tests, all Provider tests, gofmt, and `git diff --check` passed.
+- The authenticated Hub control-page path submitted `typingfix42中文流畅` after a real browser Backspace. Provider ACK was 16 ms; its 15-character WDA batch logged `queue_ms=90`, `wda_ms=521`, and `total_ms=611`; the real XR screenshot contained the exact text.
+- Hub MJPEG rendered an 828x1792 frame with 1446/1456 sampled pixels non-black.
+- After the control page loaded apps, ten more `/apps` calls each returned 23 apps in 0.214-0.295 seconds. RSS changed from 107296 KiB to 108176 KiB and the in-use heap was about 10.1 MiB; the bounded app path accounted for about 0.51 MiB.
+
+Operational note:
+
+- A WDA IPA with an expired embedded profile can appear to install while iOS rejects it with `0xe8008018`. Confirm the embedded profile expiry/device list and device syslog, rebuild with a matching valid profile, verify the app and nested signatures, preserve the old IPA, and replace the local runtime IPA before re-enabling the device.
+
 ## 2026-08-06: Bound WDA MJPEG forwarding memory
 
 Decision: both iOS WDA MJPEG outputs use fixed-buffer streaming. The HTTP multipart route owns one reusable 64 KiB copy buffer per viewer; the legacy WebSocket route owns that buffer plus one reusable 64 KiB WebSocket writer. A 32 MiB per-frame byte-count limit terminates malformed input without allocating 32 MiB.
