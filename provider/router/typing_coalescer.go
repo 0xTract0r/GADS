@@ -12,6 +12,7 @@ package router
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"sync"
@@ -57,11 +58,31 @@ var typingDownstream = func(dev devices.PlatformDevice, chars []string) (*http.R
 }
 
 type deviceTyper struct {
-	dev      devices.PlatformDevice
+	dev devices.PlatformDevice
+
 	mu       sync.Mutex
-	pending  []string // 等待被发送的字符
+	pending  []queuedTypingChar
 	flushing bool
-	firstAt  time.Time
+	wake     chan struct{}
+
+	idleWait time.Duration
+	maxWait  time.Duration
+	maxBatch int
+}
+
+type queuedTypingChar struct {
+	value       string
+	submittedAt time.Time
+}
+
+func newDeviceTyper(dev devices.PlatformDevice) *deviceTyper {
+	return &deviceTyper{
+		dev:      dev,
+		wake:     make(chan struct{}, 1),
+		idleWait: typingCoalesceIdle,
+		maxWait:  typingCoalesceMaxWait,
+		maxBatch: typingCoalesceMaxBatch,
+	}
 }
 
 func (t *deviceTyper) submit(text string) (*http.Response, error) {
@@ -75,16 +96,24 @@ func (t *deviceTyper) submit(text string) (*http.Response, error) {
 		chars = append(chars, string(r))
 	}
 
+	now := time.Now()
 	t.mu.Lock()
-	if len(t.pending) == 0 {
-		t.firstAt = time.Now()
+	for _, char := range chars {
+		t.pending = append(t.pending, queuedTypingChar{value: char, submittedAt: now})
 	}
-	t.pending = append(t.pending, chars...)
 	startFlusher := !t.flushing
 	if startFlusher {
 		t.flushing = true
 	}
 	t.mu.Unlock()
+
+	// 唤醒等待中的 flusher，让 idle deadline 从最新字符重新计算。
+	// channel 只保留一个通知：flusher 每次醒来都会从受 mutex 保护的 pending
+	// 队列读取完整状态，因此无需为每个字符排队一个通知。
+	select {
+	case t.wake <- struct{}{}:
+	default:
+	}
 
 	if startFlusher {
 		go t.flushLoop()
@@ -101,76 +130,104 @@ func (t *deviceTyper) submit(text string) (*http.Response, error) {
 
 func (t *deviceTyper) flushLoop() {
 	for {
-		// 每轮都等一个 idle 窗口：让相邻字符尽量进同一 batch。
-		// hardWait 防止极端情况下字符稳定流入导致 idle 永远不到。
-		t.mu.Lock()
-		first := t.firstAt
-		t.mu.Unlock()
-
-		idleTimer := time.NewTimer(typingCoalesceIdle)
-		hardCap := time.Until(first.Add(typingCoalesceMaxWait))
-		if hardCap < 0 {
-			hardCap = 0
-		}
-		hardTimer := time.NewTimer(hardCap)
-
-		flushNow := false
-		for !flushNow {
-			select {
-			case <-idleTimer.C:
-				flushNow = true
-			case <-hardTimer.C:
-				flushNow = true
-			}
-			t.mu.Lock()
-			batchSize := len(t.pending)
-			t.mu.Unlock()
-			if batchSize >= typingCoalesceMaxBatch {
-				flushNow = true
-			}
-		}
-		if !idleTimer.Stop() {
-			select {
-			case <-idleTimer.C:
-			default:
-			}
-		}
-		if !hardTimer.Stop() {
-			select {
-			case <-hardTimer.C:
-			default:
-			}
+		batch, firstSubmittedAt, ok := t.waitAndTakeBatch()
+		if !ok {
+			return
 		}
 
-		// 拿出当前 pending，发请求；fire-and-forget 模式下不需要把结果回传调用方。
-		t.mu.Lock()
-		batch := t.pending
-		t.pending = nil
-		t.mu.Unlock()
-
+		startedAt := time.Now()
 		resp, err := typingDownstream(t.dev, batch)
+		completedAt := time.Now()
+		queueDuration := startedAt.Sub(firstSubmittedAt)
+		wdaDuration := completedAt.Sub(startedAt)
+		totalDuration := completedAt.Sub(firstSubmittedAt)
+
+		t.mu.Lock()
+		pendingCount := len(t.pending)
+		t.mu.Unlock()
+
+		metrics := fmt.Sprintf(
+			"typing_coalescer: batch_size=%d queue_ms=%d wda_ms=%d total_ms=%d pending=%d",
+			len(batch), queueDuration.Milliseconds(), wdaDuration.Milliseconds(), totalDuration.Milliseconds(), pendingCount,
+		)
 		if err != nil {
 			t.dev.GetLogger().LogError("appium_interact",
-				"typing_coalescer: batch wda/keys failed: "+err.Error())
-		} else {
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if resp.StatusCode >= 400 {
-				t.dev.GetLogger().LogError("appium_interact",
-					"typing_coalescer: batch wda/keys non-2xx: "+string(body))
-			}
+				metrics+" status=error message="+err.Error())
+			continue
+		}
+		if resp == nil {
+			t.dev.GetLogger().LogError("appium_interact", metrics+" status=error message=nil WDA response")
+			continue
 		}
 
-		// 看是否有新的字符在 flush 期间又被压进来。
+		statusCode := resp.StatusCode
+		var body []byte
+		if resp.Body != nil {
+			body, err = io.ReadAll(resp.Body)
+			resp.Body.Close()
+		}
+		metrics += fmt.Sprintf(" status=%d", statusCode)
+		if err != nil {
+			t.dev.GetLogger().LogError("appium_interact", metrics+" message=failed reading WDA response: "+err.Error())
+		} else if statusCode >= http.StatusBadRequest {
+			t.dev.GetLogger().LogError("appium_interact", metrics+" message="+string(body))
+		} else {
+			t.dev.GetLogger().LogInfo("typing_latency", metrics)
+		}
+	}
+}
+
+// waitAndTakeBatch 等待 idle/max-wait/max-batch 任一条件满足，并原子取出
+// 下一批字符。pending 保留每个字符的真实到达时间，使 WDA 调用期间积压的
+// 字符不会在上一批完成后重新获得一整段等待窗口。
+func (t *deviceTyper) waitAndTakeBatch() ([]string, time.Time, bool) {
+	for {
 		t.mu.Lock()
 		if len(t.pending) == 0 {
 			t.flushing = false
 			t.mu.Unlock()
-			return
+			return nil, time.Time{}, false
 		}
-		// 有新字符，复用 flusher 继续下一轮。
-		t.firstAt = time.Now()
+
+		now := time.Now()
+		firstSubmittedAt := t.pending[0].submittedAt
+		lastSubmittedAt := t.pending[len(t.pending)-1].submittedAt
+		idleDeadline := lastSubmittedAt.Add(t.idleWait)
+		hardDeadline := firstSubmittedAt.Add(t.maxWait)
+		deadline := idleDeadline
+		if hardDeadline.Before(deadline) {
+			deadline = hardDeadline
+		}
+
+		shouldFlush := len(t.pending) >= t.maxBatch || !now.Before(deadline)
+		if shouldFlush {
+			batchSize := min(len(t.pending), t.maxBatch)
+			queued := append([]queuedTypingChar(nil), t.pending[:batchSize]...)
+			t.pending = t.pending[batchSize:]
+			t.mu.Unlock()
+
+			batch := make([]string, len(queued))
+			for index, char := range queued {
+				batch[index] = char.value
+			}
+			return batch, firstSubmittedAt, true
+		}
+
+		wait := deadline.Sub(now)
+		wake := t.wake
 		t.mu.Unlock()
+
+		timer := time.NewTimer(wait)
+		select {
+		case <-timer.C:
+		case <-wake:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		}
 	}
 }
 
@@ -197,7 +254,7 @@ func coalescedTypeTextIOS(dev devices.PlatformDevice, text string) (*http.Respon
 	if v, ok := typingRegistry.Load(udid); ok {
 		return v.(*deviceTyper).submit(text)
 	}
-	newT := &deviceTyper{dev: dev}
+	newT := newDeviceTyper(dev)
 	actual, _ := typingRegistry.LoadOrStore(udid, newT)
 	return actual.(*deviceTyper).submit(text)
 }
