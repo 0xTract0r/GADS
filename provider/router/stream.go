@@ -15,6 +15,7 @@ import (
 	"GADS/provider/logger"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -24,6 +25,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"GADS/provider/devices"
 
@@ -31,6 +33,59 @@ import (
 	"github.com/gobwas/ws"
 	"github.com/gobwas/ws/wsutil"
 )
+
+const (
+	iosMJPEGCopyBufferSize        = 64 * 1024
+	iosMJPEGMaxFrameBytes   int64 = 32 * 1024 * 1024
+	iosMJPEGHeaderTimeout         = 5 * time.Second
+	iosMJPEGReadIdleTimeout       = 15 * time.Second
+)
+
+var errIOSMJPEGFrameTooLarge = errors.New("iOS MJPEG frame exceeds safety limit")
+
+type iosMJPEGProxyOptions struct {
+	copyBufferSize int
+	maxFrameBytes  int64
+}
+
+var defaultIOSMJPEGProxyOptions = iosMJPEGProxyOptions{
+	copyBufferSize: iosMJPEGCopyBufferSize,
+	maxFrameBytes:  iosMJPEGMaxFrameBytes,
+}
+
+type idleReadConn struct {
+	net.Conn
+	timeout time.Duration
+}
+
+func (c *idleReadConn) Read(buffer []byte) (int, error) {
+	if c.timeout > 0 {
+		if err := c.SetReadDeadline(time.Now().Add(c.timeout)); err != nil {
+			return 0, err
+		}
+	}
+	return c.Conn.Read(buffer)
+}
+
+func newIOSMJPEGHTTPClient(headerTimeout, readIdleTimeout time.Duration) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	dialer := &net.Dialer{
+		Timeout:   headerTimeout,
+		KeepAlive: 30 * time.Second,
+	}
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		conn, err := dialer.DialContext(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		return &idleReadConn{Conn: conn, timeout: readIdleTimeout}, nil
+	}
+	transport.ResponseHeaderTimeout = headerTimeout
+	transport.DisableKeepAlives = true
+	return &http.Client{Transport: transport}
+}
+
+var iosMJPEGHTTPClient = newIOSMJPEGHTTPClient(iosMJPEGHeaderTimeout, iosMJPEGReadIdleTimeout)
 
 func IOSStreamMJPEGAuto(c *gin.Context) {
 	udid := c.Param("udid")
@@ -247,70 +302,148 @@ func IOSStreamMJPEGWda(c *gin.Context) {
 		return
 	}
 
-	// Set the necessary headers for MJPEG streaming
-	// Note: The "boundary" is arbitrary but must be unique and consistent.
-	c.Header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
-	c.Writer.WriteHeader(http.StatusOK)
-	c.Deadline()
-
-	streamUrl := "http://localhost:" + iosDev.GetWDAStreamPort()
-
-	req, err := http.NewRequest("GET", streamUrl, nil)
-	if err != nil {
-		fmt.Println("Error creating request:", err)
+	streamURL := "http://localhost:" + iosDev.GetWDAStreamPort()
+	err := proxyIOSMJPEGStream(c.Request.Context(), c.Writer, streamURL, iosMJPEGHTTPClient, defaultIOSMJPEGProxyOptions)
+	if err == nil || errors.Is(err, context.Canceled) || c.Request.Context().Err() != nil {
 		return
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	logger.ProviderLogger.LogWarn("IOSStreamMJPEGWda", fmt.Sprintf("Stopped WDA MJPEG stream for device %s: %s", udid, err))
+	if !c.Writer.Written() {
+		c.AbortWithStatus(http.StatusBadGateway)
+	}
+}
+
+func proxyIOSMJPEGStream(ctx context.Context, destination http.ResponseWriter, streamURL string, client *http.Client, options iosMJPEGProxyOptions) error {
+	if options.copyBufferSize <= 0 {
+		return errors.New("iOS MJPEG copy buffer size must be positive")
+	}
+	if options.maxFrameBytes <= 0 {
+		return errors.New("iOS MJPEG max frame size must be positive")
+	}
+
+	flusher, ok := destination.(http.Flusher)
+	if !ok {
+		return errors.New("iOS MJPEG destination does not support flushing")
+	}
+
+	resp, reader, err := openIOSMJPEGMultipart(ctx, streamURL, client)
 	if err != nil {
-		fmt.Println("Error making request:", err)
-		return
+		return err
 	}
 	defer resp.Body.Close()
 
-	// Get the media type and params after connecting to WebDriverAgent stream
-	mediaType, params, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
-	if err != nil {
-		fmt.Println("Error getting request mediaType and params:", err)
-		return
+	destination.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+	destination.Header().Set("Cache-Control", "no-store")
+	destination.WriteHeader(http.StatusOK)
+
+	copyBuffer := make([]byte, options.copyBufferSize)
+	for {
+		part, nextErr := reader.NextPart()
+		if nextErr == io.EOF {
+			return nil
+		}
+		if nextErr != nil {
+			return fmt.Errorf("read WDA MJPEG multipart boundary: %w", nextErr)
+		}
+
+		if _, err = io.WriteString(destination, "\r\n--frame\r\nContent-Type: image/jpeg\r\n\r\n"); err != nil {
+			return fmt.Errorf("write MJPEG frame header: %w", err)
+		}
+
+		frameBytes, copyErr := copyBoundedMJPEGFrame(destination, part, copyBuffer, options.maxFrameBytes)
+		if copyErr != nil {
+			return fmt.Errorf("copy WDA MJPEG frame after %d bytes: %w", frameBytes, copyErr)
+		}
+		if closeErr := part.Close(); closeErr != nil {
+			return fmt.Errorf("close WDA MJPEG frame after %d bytes: %w", frameBytes, closeErr)
+		}
+		flusher.Flush()
+	}
+}
+
+func openIOSMJPEGMultipart(ctx context.Context, streamURL string, client *http.Client) (*http.Response, *multipart.Reader, error) {
+	if client == nil {
+		return nil, nil, errors.New("iOS MJPEG HTTP client is nil")
 	}
 
-	// Get the boundary string
-	// It has leading slashes -- that need to be removed for it to work properly
-	boundary := strings.Replace(params["boundary"], "--", "", -1)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, streamURL, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create WDA MJPEG request: %w", err)
+	}
 
-	if strings.HasPrefix(mediaType, "multipart/") {
-		// Create a multipart reader from the response using the cleaned boundary
-		mr := multipart.NewReader(resp.Body, boundary)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open WDA MJPEG stream: %w", err)
+	}
 
-		// Loop and for each part in the multpart reader read the image and send it over the ws
-		for {
-			part, err := mr.NextPart()
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				break
-			}
-			jpegImage, err := io.ReadAll(part)
-			if err != nil {
-				break
-			}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		resp.Body.Close()
+		return nil, nil, fmt.Errorf("WDA MJPEG stream returned HTTP %d", resp.StatusCode)
+	}
 
-			// Write the boundary and content type for each frame
-			_, err = c.Writer.Write([]byte("\r\n--frame\r\nContent-Type: image/jpeg\r\n\r\n"))
-			if err != nil {
-				break
-			}
+	mediaType, params, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if err != nil {
+		resp.Body.Close()
+		return nil, nil, fmt.Errorf("parse WDA MJPEG content type: %w", err)
+	}
+	if !strings.HasPrefix(mediaType, "multipart/") {
+		resp.Body.Close()
+		return nil, nil, fmt.Errorf("WDA MJPEG stream returned unsupported content type %q", mediaType)
+	}
 
-			// Write the image to the response
-			_, err = c.Writer.Write(jpegImage)
-			if err != nil {
-				break
-			}
+	boundary := strings.TrimPrefix(strings.TrimSpace(params["boundary"]), "--")
+	if boundary == "" {
+		resp.Body.Close()
+		return nil, nil, errors.New("WDA MJPEG stream response has no multipart boundary")
+	}
 
-			// Flush the response writer to ensure the client receives the frame immediately
-			c.Writer.Flush()
+	return resp, multipart.NewReader(resp.Body, boundary), nil
+}
+
+func copyBoundedMJPEGFrame(destination io.Writer, source io.Reader, buffer []byte, maxFrameBytes int64) (int64, error) {
+	if len(buffer) == 0 {
+		return 0, errors.New("MJPEG copy buffer is empty")
+	}
+	if maxFrameBytes <= 0 {
+		return 0, errors.New("MJPEG frame limit must be positive")
+	}
+
+	var written int64
+	zeroReads := 0
+	for {
+		readSize := len(buffer)
+		remaining := maxFrameBytes - written
+		if remaining < int64(readSize) {
+			readSize = int(remaining) + 1
+		}
+
+		readBytes, readErr := source.Read(buffer[:readSize])
+		if readBytes > 0 {
+			zeroReads = 0
+			if written+int64(readBytes) > maxFrameBytes {
+				return written, fmt.Errorf("%w: limit=%d observed_at_least=%d", errIOSMJPEGFrameTooLarge, maxFrameBytes, maxFrameBytes+1)
+			}
+			writeBytes, writeErr := destination.Write(buffer[:readBytes])
+			written += int64(writeBytes)
+			if writeErr != nil {
+				return written, writeErr
+			}
+			if writeBytes != readBytes {
+				return written, io.ErrShortWrite
+			}
+		} else if readErr == nil {
+			zeroReads++
+			if zeroReads >= 100 {
+				return written, io.ErrNoProgress
+			}
+		}
+
+		if readErr == io.EOF {
+			return written, nil
+		}
+		if readErr != nil {
+			return written, readErr
 		}
 	}
 }
@@ -418,69 +551,67 @@ func IosStreamProxyWDA(c *gin.Context) {
 	udid := c.Param("udid")
 	platDev, ok := devices.DevManager.Get(udid)
 	if !ok {
-		logger.ProviderLogger.LogError("IosStreamProxyWDA", fmt.Sprintf("Device with UDID `%s` not found", udid))
+		logger.ProviderLogger.LogError("IosStreamProxyWDA", fmt.Sprintf("Device with UDID %s not found", udid))
+		c.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+
+	iosDev, ok2 := platDev.(*devices.IOSDevice)
+	if !ok2 {
+		logger.ProviderLogger.LogError("IosStreamProxyWDA", fmt.Sprintf("Device %s is not an iOS device", udid))
 		c.AbortWithStatus(http.StatusBadRequest)
 		return
 	}
 
 	conn, _, _, err := ws.UpgradeHTTP(c.Request, c.Writer)
 	if err != nil {
-		fmt.Println(err)
+		logger.ProviderLogger.LogError("IosStreamProxyWDA", fmt.Sprintf("Failed upgrading HTTP to WebSocket for device %s: %s", udid, err))
+		return
 	}
 	defer conn.Close()
 
-	iosDev, ok2 := platDev.(*devices.IOSDevice)
-	if !ok2 {
-		logger.ProviderLogger.LogError("IosStreamProxyWDA", fmt.Sprintf("Device `%s` is not an iOS device", udid))
-		c.AbortWithStatus(http.StatusBadRequest)
+	streamURL := "http://localhost:" + iosDev.GetWDAStreamPort()
+	err = proxyIOSMJPEGWebSocket(c.Request.Context(), conn, streamURL, iosMJPEGHTTPClient, defaultIOSMJPEGProxyOptions)
+	if err == nil || errors.Is(err, context.Canceled) || c.Request.Context().Err() != nil {
 		return
 	}
-	streamUrl := "http://localhost:" + iosDev.GetWDAStreamPort()
+	logger.ProviderLogger.LogWarn("IosStreamProxyWDA", fmt.Sprintf("Stopped WDA MJPEG WebSocket stream for device %s: %s", udid, err))
+}
 
-	req, err := http.NewRequest("GET", streamUrl, nil)
-	if err != nil {
-		fmt.Println("Error creating request:", err)
-		return
+func proxyIOSMJPEGWebSocket(ctx context.Context, destination io.Writer, streamURL string, client *http.Client, options iosMJPEGProxyOptions) error {
+	if options.copyBufferSize <= 0 {
+		return errors.New("iOS MJPEG copy buffer size must be positive")
+	}
+	if options.maxFrameBytes <= 0 {
+		return errors.New("iOS MJPEG max frame size must be positive")
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, reader, err := openIOSMJPEGMultipart(ctx, streamURL, client)
 	if err != nil {
-		fmt.Println("Error making request:", err)
-		return
+		return err
 	}
 	defer resp.Body.Close()
 
-	// Get the media type and params after connecting to WebDriverAgent stream
-	mediaType, params, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
-	if err != nil {
-		fmt.Println("Error getting request mediaType and params:", err)
-		return
-	}
+	copyBuffer := make([]byte, options.copyBufferSize)
+	websocketWriter := wsutil.NewWriterBufferSize(destination, ws.StateServerSide, ws.OpBinary, options.copyBufferSize)
+	for {
+		part, nextErr := reader.NextPart()
+		if nextErr == io.EOF {
+			return nil
+		}
+		if nextErr != nil {
+			return fmt.Errorf("read WDA MJPEG multipart boundary: %w", nextErr)
+		}
 
-	// Get the boundary string
-	// It has leading slashes -- that need to be removed for it to work properly
-	boundary := strings.Replace(params["boundary"], "--", "", -1)
-
-	// Should be multipart/x-mixed-replace
-	// We know it's that one but check just in case
-	if strings.HasPrefix(mediaType, "multipart/") {
-		// Create a multipart reader from the response using the cleaned boundary
-		mr := multipart.NewReader(resp.Body, boundary)
-
-		// Loop and for each part in the multpart reader read the image and send it over the ws
-		for {
-			part, err := mr.NextPart()
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				break
-			}
-			jpg, err := io.ReadAll(part)
-			if err != nil {
-				break
-			}
-			wsutil.WriteServerBinary(conn, jpg)
+		frameBytes, copyErr := copyBoundedMJPEGFrame(websocketWriter, part, copyBuffer, options.maxFrameBytes)
+		if copyErr != nil {
+			return fmt.Errorf("copy WDA MJPEG WebSocket frame after %d bytes: %w", frameBytes, copyErr)
+		}
+		if closeErr := part.Close(); closeErr != nil {
+			return fmt.Errorf("close WDA MJPEG WebSocket frame after %d bytes: %w", frameBytes, closeErr)
+		}
+		if flushErr := websocketWriter.Flush(); flushErr != nil {
+			return fmt.Errorf("flush WDA MJPEG WebSocket frame after %d bytes: %w", frameBytes, flushErr)
 		}
 	}
 }

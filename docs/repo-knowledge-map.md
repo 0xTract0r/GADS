@@ -1,6 +1,6 @@
 # Repo Knowledge Map
 
-Last updated: 2026-05-15
+Last updated: 2026-08-06
 
 ## Fast Onboarding
 
@@ -27,6 +27,7 @@ Last updated: 2026-05-15
 - Runtime state and provider info fields: `provider/devices/runtime.go`, `provider/devices/platform.go`, `provider/router/routes.go`.
 - Tap/swipe/type/clipboard routing: `provider/router/control.go`, `provider/router/appium.go`, `provider/router/device_routes.go`.
 - WDA MJPEG to WebRTC fallback: `provider/router/ios_stream_webrtc.go`.
+- Plain WDA MJPEG HTTP and WebSocket proxies: `provider/router/stream.go`. Both must preserve the fixed-buffer, downstream-cancellable, frame-size-bounded invariant documented in `docs/repo-memory-ledger.md` under the 2026-08-06 entry.
 - ReplayKit Broadcast H264 to WebRTC path: `provider/router/ios_stream_webrtc_broadcast.go`.
 - Broadcast host/upload extension source: `resources/ios-broadcast-extension/`.
 
@@ -46,6 +47,7 @@ Last updated: 2026-05-15
 ## Verification Baselines
 
 - Provider package tests: `go test -vet=off ./provider/...`.
+- WDA MJPEG changes also require focused normal/oversize/stall/cancel/WebSocket tests, a static check that no `io.ReadAll(part)` remains in `provider/router/stream.go`, and a reconnect-heavy RSS check.
 - Strict iOS first-frame check must assert browser `<video>` readiness and dimensions, not just WebRTC track arrival.
 - Latest restored strict Broadcast viewer evidence: `/tmp/gads-verify-13001.js` run on 2026-05-10 against `http://127.0.0.1:13001`, with `requestVideoFrameCallback` first frame, `readyState=4`, `828x1792`, and first frame around `619ms`.
 - Latest restored hub UI evidence: `/tmp/gads-verify-hub.js` run on 2026-05-10 against `http://127.0.0.1:10001`, with `/authenticate=200`, `/available-devices=200`, iPhone XR visible, real video frame callback, non-black sampled pixels, `waitingVisible=false`, `828x1792` video dimensions, and `/device/.../swipe=200`.
@@ -62,4 +64,5 @@ Last updated: 2026-05-15
 - For iOS clipboard reads, prefer direct `wda/getPasteboard` with a short timeout only when it returns non-empty text. If it returns WDA 200 with an empty value, treat that as a fast-path miss, temporarily foreground WDA, handle only positively identified paste alerts, reread, and restore the previous foreground app asynchronously. Never issue a blind coordinate tap for an alert WDA cannot identify.
 - Clipboard verification must check actual content: provider `result` must match expected non-empty text and Hub browser clipboard must read the same value. Toast `Device clipboard copied!` alone is not evidence.
 - Keep long-running provider processes in local `tmux`; record the session name, binary path, and log path in `.ai/todos.md`.
+- On iOS 17+, start and verify `tmux:gads-ios-tunnel` before restarting Provider. A provider that repeatedly times out starting WDA after a cold restart is not valid MJPEG performance evidence.
 - Before committing, ensure any Apple signing team IDs, provisioning profiles, DerivedData, or personal bundle IDs are not hardcoded unless deliberately documented as local examples.

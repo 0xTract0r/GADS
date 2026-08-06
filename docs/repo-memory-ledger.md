@@ -2,6 +2,33 @@
 
 This ledger stores stable, reusable decisions and evidence. Session-only progress stays in `.ai/todos.md`.
 
+## 2026-08-06: Bound WDA MJPEG forwarding memory
+
+Decision: both iOS WDA MJPEG outputs use fixed-buffer streaming. The HTTP multipart route owns one reusable 64 KiB copy buffer per viewer; the legacy WebSocket route owns that buffer plus one reusable 64 KiB WebSocket writer. A 32 MiB per-frame byte-count limit terminates malformed input without allocating 32 MiB.
+
+Why:
+
+- The previous HTTP and WebSocket loops called io.ReadAll(part) for every WDA multipart frame. Normal playback allocated at the full JPEG byte rate, and a missing boundary could grow one frame without a limit.
+- Activity Monitor previously reported 61.6 GB attributed memory for the Provider. The source-level invariant was missing even when retained heap appeared small in short healthy runs.
+- Downstream disconnects previously did not reliably cancel the upstream WDA request, and a stalled read had no idle deadline.
+
+Implementation memory:
+
+- provider/router/stream.go validates the upstream status and multipart boundary before committing HTTP 200.
+- Downstream request cancellation propagates to WDA. Response headers have a 5-second timeout and blocked reads a 15-second idle timeout; there is intentionally no whole-stream timeout.
+- Both HTTP and WebSocket paths share the bounded frame copier. Oversize or malformed input terminates only that viewer connection.
+
+Verification evidence:
+
+- Focused MJPEG tests, race tests, all provider tests, full build, static scan, and git diff check passed.
+- On XR at 45 FPS / JPEG 60 / scale 100, three sustained viewers plus 20 reconnects changed RSS from 192896 KB to 193008 KB; sampled peak delta was 96 KB.
+- A ten-second Provider-route sample delivered 234 frames with zero RSS drift. The extracted 828x1792 JPEG had a 0.9984 non-black ratio, and Playwright observed a first MJPEG frame in 250 ms.
+- The configured target FPS is not a guaranteed encoded FPS. This XR produced about 23.4 observed FPS at full scale; tune WDA quality/scale separately if higher visual cadence is required.
+
+Operational note:
+
+- After a Mac migration, InvalidHostID was fixed by regenerating the lockdownd pair record and refreshing the provider cache. iOS 17+ provider restarts require the persistent gads-ios-tunnel tmux service to be ready first; otherwise WDA may loop on a 60-second startup timeout.
+
 ## 2026-07-07: iOS clipboard permission fallback without blind taps
 
 Decision: keep the direct WDA pasteboard fast path, but when iOS requires foreground WDA access, mask the temporary foreground transition in the Hub and never guess the location of an `Allow Paste` button.
