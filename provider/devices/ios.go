@@ -12,6 +12,7 @@ package devices
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,6 +20,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"GADS/common"
@@ -39,6 +41,7 @@ import (
 	"github.com/danielpaulus/go-ios/ios/tunnel"
 	"github.com/danielpaulus/go-ios/ios/zipconduit"
 	"golang.org/x/sync/errgroup"
+	"howett.net/plist"
 )
 
 // IOSDevice holds iOS-specific runtime state alongside the shared RuntimeState.
@@ -51,9 +54,17 @@ type IOSDevice struct {
 	GoIOSDeviceEntry ios.DeviceEntry // go-ios library device entry for USB communication
 	GoIOSTunnel      tunnel.Tunnel   // userspace tunnel for iOS 17.4+
 	WdaReadyChan     chan bool       // signals WebDriverAgent is up after start
+	AppsMutex        sync.Mutex      // installation_proxy Browse is large and must be serialized per device
 }
 
 var wdaHTTPClient = &http.Client{Timeout: 5 * time.Second}
+
+const (
+	iosInstallationProxyService = "com.apple.mobile.installation_proxy"
+	maxIOSAppBrowsePayloadBytes = 64 << 20
+	maxIOSAppBrowseResponses    = 32
+	maxIOSInstalledApps         = 10_000
+)
 
 // Port accessors for router access via type assertion.
 func (d *IOSDevice) GetStreamPort() string    { return d.StreamPort }
@@ -635,52 +646,120 @@ func (d *IOSDevice) pair() (pairErr error) {
 	return nil
 }
 
-func (d *IOSDevice) getAllApps() ([]installationproxy.AppInfo, error) {
-	svc, err := installationproxy.New(d.GoIOSDeviceEntry)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to installation proxy for all apps: %w", err)
-	}
-	defer svc.Close()
-	return svc.BrowseAllApps()
-}
-
-func (d *IOSDevice) getUserApps() ([]installationproxy.AppInfo, error) {
-	svc, err := installationproxy.New(d.GoIOSDeviceEntry)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to installation proxy for user apps: %w", err)
-	}
-	defer svc.Close()
-	return svc.BrowseUserApps()
-}
-
 // GetInstalledApps returns detailed info about installed apps.
 func (d *IOSDevice) GetInstalledApps() ([]models.DeviceApp, error) {
-	var installedApps = make([]models.DeviceApp, 0)
-	var allApps, userApps []installationproxy.AppInfo
-
-	g, _ := errgroup.WithContext(context.Background())
-	g.Go(func() error {
-		var err error
-		allApps, err = d.getAllApps()
-		return err
-	})
-	g.Go(func() error {
-		var err error
-		userApps, err = d.getUserApps()
-		return err
-	})
-	if err := g.Wait(); err != nil {
-		return installedApps, err
+	startedAt := time.Now()
+	allApps, err := d.browseAppsBounded("", true)
+	if err != nil {
+		return nil, err
 	}
+	installedApps := deviceAppsFromIOSBrowse(allApps)
+	if deviceLogger := d.GetLogger(); deviceLogger != nil {
+		deviceLogger.LogInfo("device_apps", fmt.Sprintf(
+			"Listed iOS apps with bounded installation proxy: source_apps=%d returned_apps=%d duration_ms=%d",
+			len(allApps), len(installedApps), time.Since(startedAt).Milliseconds(),
+		))
+	}
+	return installedApps, nil
+}
+
+func (d *IOSDevice) browseAppsBounded(applicationType string, showLaunchProhibitedApps bool) ([]installationproxy.AppInfo, error) {
+	d.AppsMutex.Lock()
+	defer d.AppsMutex.Unlock()
+
+	conn, err := ios.ConnectToService(d.GoIOSDeviceEntry, iosInstallationProxyService)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to installation proxy: %w", err)
+	}
+	defer conn.Close()
+
+	clientOptions := map[string]any{}
+	if applicationType != "" {
+		clientOptions[installationproxy.ApplicationType] = applicationType
+	}
+	if showLaunchProhibitedApps {
+		clientOptions["ShowLaunchProhibitedApps"] = true
+	}
+	request := map[string]any{"ClientOptions": clientOptions, "Command": "Browse"}
+	encoded, err := ios.NewPlistCodec().Encode(request)
+	if err != nil {
+		return nil, fmt.Errorf("encode installation proxy browse request: %w", err)
+	}
+	if err := conn.Send(encoded); err != nil {
+		return nil, fmt.Errorf("send installation proxy browse request: %w", err)
+	}
+
+	apps := make([]installationproxy.AppInfo, 0, 256)
+	for responseIndex := 0; responseIndex < maxIOSAppBrowseResponses; responseIndex++ {
+		payload, readErr := readBoundedIOSPlistMessage(conn.Reader(), maxIOSAppBrowsePayloadBytes)
+		if readErr != nil {
+			return nil, fmt.Errorf("read installation proxy browse response %d: %w", responseIndex+1, readErr)
+		}
+
+		var response installationproxy.BrowseResponse
+		if _, decodeErr := plist.Unmarshal(payload, &response); decodeErr != nil {
+			return nil, fmt.Errorf("decode installation proxy browse response %d: %w", responseIndex+1, decodeErr)
+		}
+		if response.CurrentAmount > maxIOSInstalledApps {
+			if deviceLogger := d.GetLogger(); deviceLogger != nil {
+				deviceLogger.LogWarn("device_apps", fmt.Sprintf(
+					"Ignoring abnormal installation proxy CurrentAmount=%d at index=%d list_size=%d",
+					response.CurrentAmount, response.CurrentIndex, len(response.CurrentList),
+				))
+			}
+		}
+		apps, err = mergeIOSBrowseResponse(apps, response, maxIOSInstalledApps)
+		if err != nil {
+			return nil, fmt.Errorf("merge installation proxy browse response %d: %w", responseIndex+1, err)
+		}
+		if response.Status == "Complete" {
+			return apps, nil
+		}
+	}
+
+	return nil, fmt.Errorf("installation proxy browse exceeded %d responses", maxIOSAppBrowseResponses)
+}
+
+func readBoundedIOSPlistMessage(reader io.Reader, maxPayloadBytes uint32) ([]byte, error) {
+	var header [4]byte
+	if _, err := io.ReadFull(reader, header[:]); err != nil {
+		return nil, err
+	}
+	payloadBytes := binary.BigEndian.Uint32(header[:])
+	if payloadBytes > maxPayloadBytes {
+		return nil, fmt.Errorf("plist payload is %d bytes, limit is %d", payloadBytes, maxPayloadBytes)
+	}
+	payload := make([]byte, payloadBytes)
+	if _, err := io.ReadFull(reader, payload); err != nil {
+		return nil, fmt.Errorf("read %d-byte plist payload: %w", payloadBytes, err)
+	}
+	return payload, nil
+}
+
+func mergeIOSBrowseResponse(apps []installationproxy.AppInfo, response installationproxy.BrowseResponse, maxApps int) ([]installationproxy.AppInfo, error) {
+	if response.CurrentIndex > uint64(len(apps)) {
+		return nil, fmt.Errorf("response index %d leaves a gap after %d apps", response.CurrentIndex, len(apps))
+	}
+	end := response.CurrentIndex + uint64(len(response.CurrentList))
+	if end < response.CurrentIndex || end > uint64(maxApps) {
+		return nil, fmt.Errorf("response range [%d,%d) exceeds app limit %d", response.CurrentIndex, end, maxApps)
+	}
+	if end > uint64(len(apps)) {
+		apps = append(apps, make([]installationproxy.AppInfo, int(end)-len(apps))...)
+	}
+	copy(apps[int(response.CurrentIndex):int(end)], response.CurrentList)
+	return apps, nil
+}
+
+func deviceAppsFromIOSBrowse(allApps []installationproxy.AppInfo) []models.DeviceApp {
+	installedApps := make([]models.DeviceApp, 0)
 
 	bundleIdToExecutable := make(map[string]string, len(allApps))
 	for _, app := range allApps {
 		bundleIdToExecutable[app.CFBundleIdentifier()] = app.CFBundleExecutable()
-	}
-
-	for _, userApp := range userApps {
-		if !strings.Contains(userApp.CFBundleExecutable(), "WebDriverAgentRunner") && !strings.Contains(userApp.CFBundleExecutable(), "h264-broadcast-extension") {
-			installedApps = append(installedApps, models.DeviceApp{AppName: userApp.CFBundleExecutable(), BundleIdentifier: userApp.CFBundleIdentifier(), CanUninstall: true})
+		applicationType, _ := app[installationproxy.ApplicationType].(string)
+		if applicationType == "User" && !strings.Contains(app.CFBundleExecutable(), "WebDriverAgentRunner") && !strings.Contains(app.CFBundleExecutable(), "h264-broadcast-extension") {
+			installedApps = append(installedApps, models.DeviceApp{AppName: app.CFBundleExecutable(), BundleIdentifier: app.CFBundleIdentifier(), CanUninstall: true})
 		}
 	}
 
@@ -692,7 +771,7 @@ func (d *IOSDevice) GetInstalledApps() ([]models.DeviceApp, error) {
 		installedApps = append(installedApps, models.DeviceApp{AppName: appName, BundleIdentifier: bundleId, CanUninstall: false})
 	}
 
-	return installedApps, nil
+	return installedApps
 }
 
 // GetInstalledAppBundleIDs returns the bundle identifiers of all installed apps.
@@ -905,26 +984,13 @@ func (d *IOSDevice) disableProcessMemoryLimit(pid uint64) error {
 func (d *IOSDevice) GetRunningApps() ([]models.RunningApp, error) {
 	var runningApps = make([]models.RunningApp, 0)
 
-	var allApps, userApps []installationproxy.AppInfo
+	var allApps []installationproxy.AppInfo
 	var procList []instruments.ProcessInfo
 
 	g, _ := errgroup.WithContext(context.Background())
 	g.Go(func() error {
-		svc, err := installationproxy.New(d.GoIOSDeviceEntry)
-		if err != nil {
-			return fmt.Errorf("failed to connect to installation proxy for all apps: %w", err)
-		}
-		defer svc.Close()
-		allApps, err = svc.BrowseAllApps()
-		return err
-	})
-	g.Go(func() error {
-		svc, err := installationproxy.New(d.GoIOSDeviceEntry)
-		if err != nil {
-			return fmt.Errorf("failed to connect to installation proxy for user apps: %w", err)
-		}
-		defer svc.Close()
-		userApps, err = svc.BrowseUserApps()
+		var err error
+		allApps, err = d.browseAppsBounded("", true)
 		return err
 	})
 	g.Go(func() error {
@@ -950,9 +1016,10 @@ func (d *IOSDevice) GetRunningApps() ([]models.RunningApp, error) {
 	for _, bundleId := range constants.IOSSystemAppsBundleIds {
 		appsAllowList[bundleId] = true
 	}
-	for _, userApp := range userApps {
-		if !strings.Contains(userApp.CFBundleExecutable(), "WebDriverAgentRunner") && !strings.Contains(userApp.CFBundleExecutable(), "h264-broadcast-extension") {
-			appsAllowList[userApp.CFBundleIdentifier()] = true
+	for _, app := range allApps {
+		applicationType, _ := app[installationproxy.ApplicationType].(string)
+		if applicationType == "User" && !strings.Contains(app.CFBundleExecutable(), "WebDriverAgentRunner") && !strings.Contains(app.CFBundleExecutable(), "h264-broadcast-extension") {
+			appsAllowList[app.CFBundleIdentifier()] = true
 		}
 	}
 
@@ -976,12 +1043,8 @@ func (d *IOSDevice) KillApp(bundleIdentifier string) error {
 
 	g, _ := errgroup.WithContext(context.Background())
 	g.Go(func() error {
-		svc, err := installationproxy.New(d.GoIOSDeviceEntry)
-		if err != nil {
-			return fmt.Errorf("failed to connect to installation proxy: %w", err)
-		}
-		defer svc.Close()
-		allApps, err = svc.BrowseAllApps()
+		var err error
+		allApps, err = d.browseAppsBounded("", true)
 		return err
 	})
 	g.Go(func() error {
